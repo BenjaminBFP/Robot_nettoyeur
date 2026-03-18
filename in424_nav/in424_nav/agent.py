@@ -29,7 +29,7 @@ class Agent(Node):
 
         #initialize attributes
         self.agents_pose = [None]*self.nb_agents    #[(x_1, y_1), (x_2, y_2), (x_3, y_3)] if there are 3 agents
-        self.x = self.y = self.yaw = None   #the pose of this specific agent running the node
+        self.x = self.y = self.yaw = self.n = self.angle_increment = self.angle_max = self.angle_min = self.ranges = self.theta = self.range_max = None   #the pose of this specific agent running the node
 
         self.map_agent_pub = self.create_publisher(OccupancyGrid, f"/{self.ns}/map", 1) #publisher for agent's own map
         self.init_map()
@@ -118,7 +118,7 @@ class Agent(Node):
         """ 
             @brief Get agent 2 position.
             This method is automatically called whenever a new message is published on topic /bot_2/odom.
-            
+             
             @param msg This is a nav_msgs/msg/Odometry message.
         """
         x, y = msg.pose.pose.position.x, msg.pose.pose.position.y
@@ -145,79 +145,64 @@ class Agent(Node):
 
 
     def map_update(self):
-            """ Consider sensor readings to update the agent's map """
+        """ Consider sensor readings to update the agent's map """
 
-            if self.ranges is None or self.x is None:
-                return
-            
-            xp_m = np.zeros(self.n)
-            yp_m = np.zeros(self.n)
-            zeros = np.zeros(self.n)
-            ones = np.ones(self.n)
-
-            angles = np.linspace(self.angle_min, self.angle_max, self.n, endpoint=False)
-            xp_m = self.x + self.ranges * np.cos(angles)
-            yp_m = self.y + self.ranges * np.sin(angles)
-
-            obstacle = np.vstack([
-                xp_m,
-                yp_m,
-                np.zeros(self.n),
-                np.ones(self.n)
-            ])
-    
-            transformation = np.array([[np.cos(self.theta), -np.sin(self.theta), zeros, self.x], 
-                            [-np.sin(self.theta), -np.cos(self.theta), zeros, self.y],
-                            [zeros, zeros, ones, zeros],
-                            [zeros, zeros, zeros, ones]])
-
-            map_points = transformation @ obstacle
-
-            xp_m = map_points[0, :]
-            yp_m = map_points[1, :]
+        if self.ranges is None or self.x is None:
+            return
         
-            resolution = self.map_msg.info.resolution
-            grid_size_x = self.w
-            grid_size_y = self.h
+        xp_m = []
+        yp_m = []
 
-            origin_x = self.map_msg.info.origin.position.x
-            origin_y = self.map_msg.info.origin.position.y
+        for i, r in enumerate(self.ranges) :
 
-            robot_i = int((self.x - origin_x) / resolution)
-            robot_j = int((self.y - origin_y) / resolution)
+            xp_m.append(r * np.cos(self.theta[i])*np.cos(self.yaw) - r * np.sin(self.theta[i])*np.sin(self.yaw))
+            yp_m.append(r * np.sin(self.theta[i])*np.sin(self.yaw) + r * np.sin(self.theta[i])*np.cos(self.yaw))
 
-            for r, x, y in zip(self.ranges, xp_m, yp_m):
+        
+        resolution = self.map_msg.info.resolution
+        grid_size_x = self.w
+        grid_size_y = self.h
 
-                    if np.isinf(r) or np.isnan(r):
-                        continue
+        origin_x = self.map_msg.info.origin.position.x
+        origin_y = self.map_msg.info.origin.position.y
 
-                    # conversion
-                    i = int((x - origin_x) / resolution)
-                    j = int((y - origin_y) / resolution)
+        robot_i = int((self.x - origin_x) / resolution)
+        robot_j = int((self.y - origin_y) / resolution)
 
-                    # hors map
-                    if not (0 <= i < grid_size_x and 0 <= j < grid_size_y):
-                        continue
+        for r, x, y in zip(self.ranges, xp_m, yp_m):
 
-                    # obstacle
-                    self.map[j, i] = OBSTACLE_VALUE
+                if np.isinf(r) or np.isnan(r):
+                    continue
+                
 
-                    # espace libre 
-                    num = max(abs(i - robot_i), abs(j - robot_j))
+                # conversion
+                i = int(((x - origin_x) / resolution))
+                j = int(((y - origin_y) / resolution))
 
-                    if num == 0:
-                        continue
+                # hors map
+                if not (0 <= i < grid_size_x and 0 <= j < grid_size_y):
+                    continue
 
-                    for k in range(num):
+                # obstacle
+                self.map[j, i] = OBSTACLE_VALUE
 
-                        xi = int(robot_i + (i - robot_i) * k / num)
-                        yj = int(robot_j + (j - robot_j) * k / num)
+                # espace libre 
+                num = max(abs(i - robot_i), abs(j - robot_j))
 
-                        if 0 <= xi < grid_size_x and 0 <= yj < grid_size_y:
+                if num == 0:
+                    continue
 
-                            # ne pas écraser un obstacle
-                            if self.map[yj, xi] != OBSTACLE_VALUE:
-                                self.map[yj, xi] = FREE_SPACE_VALUE
+                for k in range(num):
+
+                    xi = int(robot_i + (i - robot_i) * k / num)
+                    yj = int(robot_j + (j - robot_j) * k / num)
+
+                    if 0 <= xi < grid_size_x and 0 <= yj < grid_size_y:
+
+                        # ne pas Ã©craser un obstacle
+                        if self.map[yj, xi] != OBSTACLE_VALUE:
+                            self.map[yj, xi] = FREE_SPACE_VALUE
+
 
     def lidar_cb(self, msg):
         """ 
@@ -231,7 +216,9 @@ class Agent(Node):
         self.angle_increment = msg.angle_increment
         self.angle_max = msg.angle_max
         self.angle_min = msg.angle_min
-
+        self.theta = np.linspace(msg.angle_min, msg.angle_max, msg.angle_increment, endpoint=True)
+        self.range_max = msg.range_max
+        pass
 
     def publish_maps(self):
         """ 
