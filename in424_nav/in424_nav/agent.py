@@ -147,16 +147,18 @@ class Agent(Node):
     def map_update(self):
         """ Consider sensor readings to update the agent's map """
 
-        if self.ranges is None or self.x is None:
-            return
-        
+        #if self.ranges is None or self.x is None:
+         #   return
+        print(self.angle_min, self.angle_max, self.angle_increment)
         xp_m = []
         yp_m = []
-
+        angles = np.linspace(self.angle_min, self.angle_max, len(self.ranges), endpoint=False)
         for i, r in enumerate(self.ranges) :
+            if np.isinf(r) :
+                r = self.range_max
 
-            xp_m.append(r * np.cos(self.theta[i])*np.cos(self.yaw) - r * np.sin(self.theta[i])*np.sin(self.yaw))
-            yp_m.append(r * np.sin(self.theta[i])*np.sin(self.yaw) + r * np.sin(self.theta[i])*np.cos(self.yaw))
+            xp_m.append(r * np.cos(angles[i])*np.cos(self.yaw) - r * np.sin(angles[i])*np.sin(self.yaw))
+            yp_m.append(r * np.sin(angles[i])*np.sin(self.yaw) + r * np.sin(angles[i])*np.cos(self.yaw))
 
         
         resolution = self.map_msg.info.resolution
@@ -216,8 +218,8 @@ class Agent(Node):
         self.angle_increment = msg.angle_increment
         self.angle_max = msg.angle_max
         self.angle_min = msg.angle_min
-        self.theta = np.linspace(msg.angle_min, msg.angle_max, msg.angle_increment, endpoint=True)
         self.range_max = msg.range_max
+        
         pass
 
     def publish_maps(self):
