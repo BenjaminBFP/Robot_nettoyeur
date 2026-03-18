@@ -145,9 +145,79 @@ class Agent(Node):
 
 
     def map_update(self):
-        """ Consider sensor readings to update the agent's map """
-        pass
+            """ Consider sensor readings to update the agent's map """
+
+            if self.ranges is None or self.x is None:
+                return
+            
+            xp_m = np.zeros(self.n)
+            yp_m = np.zeros(self.n)
+            zeros = np.zeros(self.n)
+            ones = np.ones(self.n)
+
+            angles = np.linspace(self.angle_min, self.angle_max, self.n, endpoint=False)
+            xp_m = self.x + self.ranges * np.cos(angles)
+            yp_m = self.y + self.ranges * np.sin(angles)
+
+            obstacle = np.vstack([
+                xp_m,
+                yp_m,
+                np.zeros(self.n),
+                np.ones(self.n)
+            ])
     
+            transformation = np.array([[np.cos(self.theta), -np.sin(self.theta), zeros, self.x], 
+                            [-np.sin(self.theta), -np.cos(self.theta), zeros, self.y],
+                            [zeros, zeros, ones, zeros],
+                            [zeros, zeros, zeros, ones]])
+
+            map_points = transformation @ obstacle
+
+            xp_m = map_points[0, :]
+            yp_m = map_points[1, :]
+        
+            resolution = self.map_msg.info.resolution
+            grid_size_x = self.w
+            grid_size_y = self.h
+
+            origin_x = self.map_msg.info.origin.position.x
+            origin_y = self.map_msg.info.origin.position.y
+
+            robot_i = int((self.x - origin_x) / resolution)
+            robot_j = int((self.y - origin_y) / resolution)
+
+            for r, x, y in zip(self.ranges, xp_m, yp_m):
+
+                    if np.isinf(r) or np.isnan(r):
+                        continue
+
+                    # conversion
+                    i = int((x - origin_x) / resolution)
+                    j = int((y - origin_y) / resolution)
+
+                    # hors map
+                    if not (0 <= i < grid_size_x and 0 <= j < grid_size_y):
+                        continue
+
+                    # obstacle
+                    self.map[j, i] = OBSTACLE_VALUE
+
+                    # espace libre 
+                    num = max(abs(i - robot_i), abs(j - robot_j))
+
+                    if num == 0:
+                        continue
+
+                    for k in range(num):
+
+                        xi = int(robot_i + (i - robot_i) * k / num)
+                        yj = int(robot_j + (j - robot_j) * k / num)
+
+                        if 0 <= xi < grid_size_x and 0 <= yj < grid_size_y:
+
+                            # ne pas écraser un obstacle
+                            if self.map[yj, xi] != OBSTACLE_VALUE:
+                                self.map[yj, xi] = FREE_SPACE_VALUE
 
     def lidar_cb(self, msg):
         """ 
@@ -156,7 +226,12 @@ class Agent(Node):
             
             @param msg This is a sensor_msgs/msg/LaserScan message.
         """
-        pass
+        self.ranges = msg.ranges
+        self.n = len(self.ranges)
+        self.angle_increment = msg.angle_increment
+        self.angle_max = msg.angle_max
+        self.angle_min = msg.angle_min
+
 
     def publish_maps(self):
         """ 
