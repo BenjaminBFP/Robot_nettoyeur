@@ -149,10 +149,11 @@ class Agent(Node):
 
         #if self.ranges is None or self.x is None:
          #   return
-        print(self.angle_min, self.angle_max, self.angle_increment)
+        
         xp_m = []
         yp_m = []
         angles = np.linspace(self.angle_min, self.angle_max, len(self.ranges), endpoint=False)
+        
         for i, r in enumerate(self.ranges) :
             if np.isinf(r) :
                 r = self.range_max
@@ -179,7 +180,8 @@ class Agent(Node):
 
                 # conversion
                 i = int(((x - origin_x) / resolution))
-                j = int(((y - origin_y) / resolution))
+                j = int((y - origin_y) / resolution)
+                j = grid_size_y - 1 - j
 
                 # hors map
                 if not (0 <= i < grid_size_x and 0 <= j < grid_size_y):
