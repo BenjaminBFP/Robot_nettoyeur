@@ -154,6 +154,7 @@ class Agent(Node):
         yp_m = []
         angles = np.linspace(self.angle_min, self.angle_max, len(self.ranges), endpoint=False)
         detected_points = []    
+        # self.get_logger().info(f"self.x: {self.x}, self.y: {self.y}")
         for i, r in enumerate(self.ranges) :
             if np.isinf(r) :
                 detected_points.append(0)
@@ -162,7 +163,7 @@ class Agent(Node):
             else :
                 detected_points.append(1)
             xp_m.append(r * np.cos(angles[i])*np.cos(self.yaw) - r * np.sin(angles[i])*np.sin(self.yaw)+ self.x)
-            yp_m.append(-r * np.sin(angles[i])*np.cos(self.yaw) - r * np.cos(angles[i])*np.sin(self.yaw)+ self.y)
+            yp_m.append(-r * np.sin(angles[i])*np.cos(self.yaw) - r * np.cos(angles[i])*np.sin(self.yaw)- self.y)
 
         
         resolution = self.map_msg.info.resolution
@@ -170,15 +171,14 @@ class Agent(Node):
         grid_size_y = self.h
         origin_x = self.map_msg.info.origin.position.x
         origin_y = self.map_msg.info.origin.position.y
-
         robot_i = int((self.x - origin_x) / resolution)
-        robot_j = int((self.y - origin_y) / resolution)
+        robot_j = int((-self.y - origin_y) / resolution)
 
         for r, x, y, detected in zip(self.ranges, xp_m, yp_m, detected_points):                
 
                 # conversion
                 i = int(((x - origin_x) / resolution))
-                j = int((-y - origin_y) / resolution)
+                j = int(((y - origin_y) / resolution))
 
                 # hors map
                 if not (0 <= i < grid_size_x and 0 <= j < grid_size_y):
