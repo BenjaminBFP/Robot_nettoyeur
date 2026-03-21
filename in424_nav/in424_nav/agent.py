@@ -154,7 +154,6 @@ class Agent(Node):
         yp_m = []
         angles = np.linspace(self.angle_min, self.angle_max, len(self.ranges), endpoint=False)
         detected_points = []    
-        # self.get_logger().info(f"self.x: {self.x}, self.y: {self.y}")
         for i, r in enumerate(self.ranges) :
             if np.isinf(r) :
                 detected_points.append(0)
@@ -177,8 +176,8 @@ class Agent(Node):
         for r, x, y, detected in zip(self.ranges, xp_m, yp_m, detected_points):                
 
                 # conversion
-                i = int(((x - origin_x) / resolution))
-                j = int(((y - origin_y) / resolution))
+                i = int((round((x - origin_x) / resolution)))
+                j = int(round(((y - origin_y) / resolution)))
 
                 # hors map
                 if not (0 <= i < grid_size_x and 0 <= j < grid_size_y):
@@ -231,12 +230,122 @@ class Agent(Node):
         self.map_agent_pub.publish(self.map_msg)    #publish map to other agents
 
 
+    def get_frontiers(self, x_min, x_max):
+        """
+        Parcourt toutes les cases de la carte entre x_min et x_max
+        et retourne les cases inexplorées qui ont au moins un voisin libre.
+        Ce sont les "frontières" : la limite entre connu et inconnu.
+        """
+        frontiers = []
+        for j in range(self.h):
+            for i in range(x_min, x_max):
+                if self.map[j, i] == UNEXPLORED_SPACE_VALUE:
+                    # Vérifier les 4 voisins (haut, bas, gauche, droite)
+                    neighbors = [(j-1, i), (j+1, i), (j, i-1), (j, i+1)]
+                    for nj, ni in neighbors:
+                        if 0 <= nj < self.h and 0 <= ni < self.w:
+                            if self.map[nj, ni] == FREE_SPACE_VALUE:
+                                frontiers.append((i, j))
+                                break  # pas besoin de vérifier les autres voisins
+        return frontiers
+    
+    
     def strategy(self):
-        """ Decision and action layers """
-        pass
+        if self.x is None or self.map is None or self.ranges is None:
+            return
 
+        # -------------------------------------------------------
+        # SÉCURITÉ — Vérifier si un obstacle est trop proche
+        # On regarde les rayons LIDAR dans un cône devant le robot
+        # -------------------------------------------------------
+        SAFETY_DISTANCE = 1 # distance de sécurité en mètres
 
+        ranges = np.array(self.ranges)
+        n = len(ranges)
+        angles = np.linspace(self.angle_min, self.angle_max, n, endpoint=False)
 
+        # On ne regarde que les rayons dans un cône de ±45° devant le robot
+        # (angles entre -pi/4 et pi/4 dans le repère du robot)
+        front_mask = (angles > -np.pi/4) & (angles < np.pi/4)
+        front_ranges = ranges[front_mask]
+        front_angles = angles[front_mask]
+
+        # Remplacer les inf par range_max pour le calcul
+        front_ranges = np.where(np.isinf(front_ranges), self.range_max, front_ranges)
+
+        # Y a-t-il un obstacle dans le cône avant à moins de SAFETY_DISTANCE ?
+        obstacle_ahead = np.any(front_ranges < SAFETY_DISTANCE)
+
+        if obstacle_ahead:
+            # Calculer de quel côté l'obstacle est le plus proche
+            # pour tourner dans la direction opposée
+            left_mask = front_angles > 0
+            right_mask = front_angles < 0
+
+            min_left = np.min(front_ranges[left_mask]) if np.any(left_mask) else self.range_max
+            min_right = np.min(front_ranges[right_mask]) if np.any(right_mask) else self.range_max
+
+            msg = Twist()
+            msg.linear.x = 0.0  # on arrête d'avancer
+
+            if min_left < min_right:
+                # obstacle plus proche à gauche → tourner à droite
+                msg.angular.z = -0.5
+            else:
+                # obstacle plus proche à droite → tourner à gauche
+                msg.angular.z = 0.5
+
+            self.cmd_vel_pub.publish(msg)
+            return  # on ne continue pas vers la frontière tant qu'il y a un obstacle
+
+        # -------------------------------------------------------
+        # Si pas d'obstacle → continuer la stratégie frontier
+        # -------------------------------------------------------
+        robot_id = int(self.ns[-1])
+        zone_width = self.w // self.nb_agents
+        zone_x_min = (robot_id - 1) * zone_width
+        zone_x_max = zone_x_min + zone_width if robot_id < self.nb_agents else self.w
+
+        frontiers = self.get_frontiers(zone_x_min, zone_x_max)
+        if len(frontiers) == 0:
+            frontiers = self.get_frontiers(0, self.w)
+        if len(frontiers) == 0:
+            msg = Twist()
+            msg.linear.x = 0.0
+            msg.angular.z = 0.0
+            self.cmd_vel_pub.publish(msg)
+            return
+
+        resolution = self.map_msg.info.resolution
+        origin_x = self.map_msg.info.origin.position.x
+        origin_y = self.map_msg.info.origin.position.y
+
+        robot_i = int(round((self.x - origin_x) / resolution))
+        robot_j = int(round((-self.y - origin_y) / resolution))
+
+        closest = min(frontiers, key=lambda f: (f[0] - robot_i)**2 + (f[1] - robot_j)**2)
+
+        target_x = closest[0] * resolution + origin_x
+        target_y = -(closest[1] * resolution + origin_y)
+
+        dx = target_x - self.x
+        dy = target_y - self.y
+        distance = np.sqrt(dx**2 + dy**2)
+        angle_to_target = np.arctan2(dy, dx)
+        angle_diff = np.arctan2(np.sin(angle_to_target - self.yaw), np.cos(angle_to_target - self.yaw))
+
+        msg = Twist()
+        if abs(angle_diff) > 0.2:
+            msg.linear.x = 0.0
+            msg.angular.z = 0.5 * np.sign(angle_diff)
+        elif distance > 0.3:
+            msg.linear.x = 0.3
+            msg.angular.z = 0.2 * angle_diff
+        else:
+            msg.linear.x = 0.0
+            msg.angular.z = 0.0
+
+        self.cmd_vel_pub.publish(msg)
 
 
 def main():
