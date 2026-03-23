@@ -77,8 +77,7 @@ class MapManager(Node):
         received_map = np.flipud(np.array(msg.data).reshape(self.h, self.w))    #convert the received list into a 2D array and reverse rows
         for i in range(self.h):
             for j in range(self.w):
-                if (self.merged_map[i, j] == UNEXPLORED_SPACE_VALUE) and (received_map[i, j] != UNEXPLORED_SPACE_VALUE):
-                # if (received_map[i, j] != UNEXPLORED_SPACE_VALUE):
+                if received_map[i, j] != UNEXPLORED_SPACE_VALUE:    #if the cell is not unexplored, update the merged map with the received value
                     self.merged_map[i, j] = received_map[i, j]
     
 
