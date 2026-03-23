@@ -173,14 +173,14 @@ class Agent(Node):
         grid_size_y = self.h
         origin_x = self.map_msg.info.origin.position.x
         origin_y = self.map_msg.info.origin.position.y
-        robot_i = int((self.x - origin_x) / resolution)
-        robot_j = int((-self.y - origin_y) / resolution)
+        robot_i = int(np.floor((self.x - origin_x) / resolution))
+        robot_j = int(np.floor((-self.y - origin_y) / resolution))
 
         for r, x, y, detected in zip(self.ranges, xp_m, yp_m, detected_points):                
 
                 # conversion
-                i = int(((x - origin_x) / resolution))
-                j = int(((y - origin_y) / resolution))
+                i = int(np.floor(((x - origin_x) / resolution)))
+                j = int(np.floor(((y - origin_y) / resolution)))
 
                 # hors map
                 if not (0 <= i < grid_size_x and 0 <= j < grid_size_y):
@@ -198,8 +198,8 @@ class Agent(Node):
 
                 for k in range(num):
 
-                    xi = int(robot_i + (i - robot_i) * k / num)
-                    yj = int(robot_j + (j - robot_j) * k / num)
+                    xi = int(np.floor(robot_i + (i - robot_i) * k / num))
+                    yj = int(np.floor(robot_j + (j - robot_j) * k / num))
 
                     if 0 <= xi < grid_size_x and 0 <= yj < grid_size_y:
 
@@ -233,159 +233,103 @@ class Agent(Node):
         self.map_agent_pub.publish(self.map_msg)    #publish map to other agents
 
 
+    def get_frontiers(self):
+        frontiers = []
+        for j in range(self.h):
+            for i in range(self.w):
+                if self.map[j, i] == UNEXPLORED_SPACE_VALUE:
+                    for nj, ni in [(j-1,i),(j+1,i),(j,i-1),(j,i+1)]:
+                        if 0 <= nj < self.h and 0 <= ni < self.w:
+                            if self.map[nj, ni] == FREE_SPACE_VALUE:
+                                frontiers.append((i, j))
+                                break
+        return frontiers
+
+
     def strategy(self):
-        """
-        Decision and action layers.
-        Frontier-based exploration (slides 54-69) with LIDAR wall avoidance.
-
-        Wall avoidance logic:
-          - Only the FRONT sector (±45°) triggers avoidance.
-          - The robot turns 90° in the trigonometric direction (CCW) relative
-            to the angle of the closest front beam.
-          - Side obstacles do NOT stop the robot; navigation naturally steers
-            away from them via heading control toward the frontier.
-        """
-        cmd = Twist()
-
-        if self.ranges is None or self.x is None or self.yaw is None:
+        if self.x is None or self.ranges is None:
             return
 
-        # ------------------------------------------------------------------ #
-        #  PARAMETERS                                                          #
-        # ------------------------------------------------------------------ #
-        WALL_THRESHOLD = 0.6    # [m] — only react when truly close in front
-        LINEAR_SPEED   = 0.3    # [m/s]
-        ANGULAR_SPEED  = 0.5    # [rad/s]
-        GOAL_THRESHOLD = 0.5    # [m] consider frontier reached
-        NAV_KP         = 1.2    # heading proportional gain
+        if not hasattr(self, 'target_yaw'):
+            self.target_yaw = None
+            self.rotation_count = 0
+            self.last_target = None
 
+        ranges = np.array(self.ranges)
+        angles = np.linspace(self.angle_min, self.angle_max, len(ranges), endpoint=False)
+        ranges_clean = np.where(np.isinf(ranges), self.range_max, ranges)
+        front_mask = (angles > -np.pi/2) & (angles < np.pi/2)
 
-        # ------------------------------------------------------------------ #
-        #  1. WALL AVOIDANCE                                                  #
-        #                                                                     #
-        #  Si on tourne : on tourne, point. Pas de LIDAR, pas d'avance.      #
-        #  Une fois pi/2 atteint : on regarde devant et on avance.           #
-        # ------------------------------------------------------------------ #
+        msg = Twist()
 
-        # --- En cours de rotation : on tourne jusqu'au bout, rien d'autre ---
-        if self.avoid_phase == 'rotating':
-            yaw_error = np.arctan2(
-                np.sin(self.avoid_target_yaw - self.yaw),
-                np.cos(self.avoid_target_yaw - self.yaw)
-            )
-            if abs(yaw_error) > 0.05:
-                cmd.linear.x  = 0.0
-                cmd.angular.z = float(ANGULAR_SPEED * np.sign(yaw_error))
-                self.cmd_vel_pub.publish(cmd)
-                self.get_logger().info(f"[AVOID] rotating yaw_err={np.degrees(yaw_error):.1f} deg")
+        # Rotation en cours → continuer
+        if self.target_yaw is not None:
+            angle_diff = np.arctan2(np.sin(self.target_yaw - self.yaw), np.cos(self.target_yaw - self.yaw))
+            if abs(angle_diff) > 0.05:
+                msg.linear.x = 0.0
+                msg.angular.z = 0.5 * np.sign(angle_diff)
+                self.cmd_vel_pub.publish(msg)
                 return
             else:
-                self.get_logger().info("[AVOID] pi/2 done — resuming.")
-                self.avoid_phase = 'none'
+                self.target_yaw = None
 
-        # --- Phase normale : on regarde devant et on décide ---
-        ranges_arr = np.array(self.ranges, dtype=float)
-        angles     = np.linspace(self.angle_min, self.angle_max,
-                                 len(ranges_arr), endpoint=False)
-        valid      = np.isfinite(ranges_arr)
-
-        front_mask   = np.abs(angles) <= np.pi / 12  # ±15°
-        front_valid  = front_mask & valid
-        front_ranges = np.where(front_valid, ranges_arr, np.inf)
-        min_front    = float(np.min(front_ranges)) if front_valid.any() else np.inf
-
-        if min_front <= WALL_THRESHOLD:
-            # Déclencher une rotation exacte de pi/2 CCW (trigonométrique)
-            self.avoid_target_yaw = np.arctan2(
-                np.sin(self.yaw + np.pi / 2.0),
-                np.cos(self.yaw + np.pi / 2.0)
+        # Obstacle devant → tourner de 90°
+        if np.any(ranges_clean[front_mask] < 1.0):
+            self.rotation_count += 1
+            self.target_yaw = np.arctan2(
+                np.sin(self.yaw + np.pi/2),
+                np.cos(self.yaw + np.pi/2)
             )
-            self.avoid_phase  = 'rotating'
-            cmd.linear.x  = 0.0
-            cmd.angular.z = float(ANGULAR_SPEED)
-            self.cmd_vel_pub.publish(cmd)
-            self.get_logger().info(
-                f"[AVOID] wall at {min_front:.2f}m — pi/2 rotation started "
-                f"target_yaw={np.degrees(self.avoid_target_yaw):.1f} deg"
-            )
+            # Après 4 rotations (360°) sans avancer → changer de frontière
+            if self.rotation_count >= 4:
+                self.rotation_count = 0
+                self.last_target = self.last_target  # forcer un nouveau choix
+                self.excluded_target = self.last_target
+            msg.linear.x = 0.0
+            msg.angular.z = 0.0
+            self.cmd_vel_pub.publish(msg)
             return
 
-        # ------------------------------------------------------------------ #
-        #  2. FRONTIER DETECTION                                              #
-        # ------------------------------------------------------------------ #
-        m          = self.map
-        unexplored = (m == UNEXPLORED_SPACE_VALUE)
-        free       = (m == FREE_SPACE_VALUE)
+        # Pas d'obstacle → choisir frontière
+        self.rotation_count = 0
+        frontiers = self.get_frontiers()
 
-        has_free_nb = (
-            np.roll(free,  1, axis=0) | np.roll(free, -1, axis=0) |
-            np.roll(free,  1, axis=1) | np.roll(free, -1, axis=1)
-        )
-        has_free_nb[ 0, :] = False
-        has_free_nb[-1, :] = False
-        has_free_nb[:,  0] = False
-        has_free_nb[:, -1] = False
-
-        frontier_rows, frontier_cols = np.where(unexplored & has_free_nb)
-
-        if frontier_rows.size == 0:
-            self.get_logger().info("[DONE] No frontiers left — exploration complete.")
-            self.cmd_vel_pub.publish(cmd)
+        if len(frontiers) == 0:
+            msg.linear.x = 0.0
+            msg.angular.z = 0.0
+            self.cmd_vel_pub.publish(msg)
             return
 
-        # ------------------------------------------------------------------ #
-        #  3. NEAREST FRONTIER                                                #
-        # ------------------------------------------------------------------ #
         resolution = self.map_msg.info.resolution
-        origin_x   = self.map_msg.info.origin.position.x
-        origin_y   = self.map_msg.info.origin.position.y
+        origin_x = self.map_msg.info.origin.position.x
+        origin_y = self.map_msg.info.origin.position.y
+        robot_i = int(np.floor((self.x - origin_x) / resolution))
+        robot_j = int(np.floor((-self.y - origin_y) / resolution))
 
-        wx_all = frontier_cols * resolution + origin_x
-        wy_all = frontier_rows * resolution + origin_y  # j = (y - origin_y)/res  →  y = row*res + origin_y
+        # Exclure la frontière inaccessible si trop de rotations
+        excluded = getattr(self, 'excluded_target', None)
+        filtered = [f for f in frontiers if f != excluded] if excluded else frontiers
+        if len(filtered) == 0:
+            filtered = frontiers
+            self.excluded_target = None
 
-        dists  = np.hypot(wx_all - self.x, wy_all - self.y)
-        best   = int(np.argmin(dists))
-        tx, ty = float(wx_all[best]), float(wy_all[best])
+        target = min(filtered, key=lambda f: (f[0]-robot_i)**2 + (f[1]-robot_j)**2)
+        self.last_target = target
 
-        # ------------------------------------------------------------------ #
-        #  4. NAVIGATE TO FRONTIER                                            #
-        # ------------------------------------------------------------------ #
-        dx   = tx - self.x
-        dy   = ty - self.y
-        dist = np.hypot(dx, dy)
+        target_x = target[0] * resolution + origin_x
+        target_y = -(target[1] * resolution + origin_y)
 
-        if dist < GOAL_THRESHOLD:
-            self.cmd_vel_pub.publish(cmd)
-            return
+        angle_to_target = np.arctan2(target_y - self.y, target_x - self.x)
+        angle_diff = np.arctan2(np.sin(angle_to_target - self.yaw), np.cos(angle_to_target - self.yaw))
 
-        target_angle  = np.arctan2(dy, dx)
-        heading_error = np.arctan2(
-            np.sin(target_angle - self.yaw),
-            np.cos(target_angle - self.yaw)
-        )
-
-        # Toujours avancer (même vitesse réduite si grosse erreur d'angle)
-        # pour éviter de tourner sur place indéfiniment
-        if abs(heading_error) > np.pi / 2:
-            # Erreur > 90° : rotation pure, cible vraiment derrière
-            cmd.linear.x  = 0.0
-            cmd.angular.z = float(ANGULAR_SPEED * np.sign(heading_error))
+        if abs(angle_diff) > 0.3:
+            msg.linear.x = 0.0
+            msg.angular.z = 0.5 * np.sign(angle_diff)
         else:
-            # Avance en corrigeant le cap, vitesse proportionnelle à l'alignement
-            scale = 1.0 - abs(heading_error) / (np.pi / 2)
-            cmd.linear.x  = float(LINEAR_SPEED * scale)
-            cmd.angular.z = float(NAV_KP * heading_error)
+            msg.linear.x = 0.3
+            msg.angular.z = 0.3 * angle_diff
 
-        self.get_logger().info(
-            f"[NAV] pos=({self.x:.2f},{self.y:.2f}) yaw={np.degrees(self.yaw):.1f}° "
-            f"target=({tx:.2f},{ty:.2f}) target_angle={np.degrees(target_angle):.1f}° "
-            f"err={np.degrees(heading_error):.1f}° "
-            f"lin={cmd.linear.x:.2f} ang={cmd.angular.z:.2f}"
-        )
-        self.cmd_vel_pub.publish(cmd)
-
-
-
+        self.cmd_vel_pub.publish(msg)
 
 
 def main():
