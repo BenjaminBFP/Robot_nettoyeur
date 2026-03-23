@@ -203,8 +203,6 @@ class Agent(Node):
 
                     if 0 <= xi < grid_size_x and 0 <= yj < grid_size_y:
 
-                        # ne pas Ã©craser un obstacle
-                        if self.map[yj, xi] != OBSTACLE_VALUE:
                             self.map[yj, xi] = FREE_SPACE_VALUE
 
 
@@ -234,64 +232,44 @@ class Agent(Node):
 
 
     def get_frontiers(self):
-        frontiers = []
-        for j in range(self.h):
-            for i in range(self.w):
-                if self.map[j, i] == UNEXPLORED_SPACE_VALUE:
-                    for nj, ni in [(j-1,i),(j+1,i),(j,i-1),(j,i+1)]:
-                        if 0 <= nj < self.h and 0 <= ni < self.w:
-                            if self.map[nj, ni] == FREE_SPACE_VALUE:
-                                frontiers.append((i, j))
-                                break
-        return frontiers
+            frontiers = []
+            for j in range(self.h):
+                for i in range(self.w):
+                    if self.map[j, i] == UNEXPLORED_SPACE_VALUE:
+                        for nj, ni in [(j-1,i),(j+1,i),(j,i-1),(j,i+1)]:
+                            if 0 <= nj < self.h and 0 <= ni < self.w:
+                                if self.map[nj, ni] == FREE_SPACE_VALUE:
+                                    frontiers.append((i, j))
+                                    break
+            return frontiers
 
 
     def strategy(self):
         if self.x is None or self.ranges is None:
             return
 
-        if not hasattr(self, 'target_yaw'):
-            self.target_yaw = None
-            self.rotation_count = 0
-            self.last_target = None
+        SAFETY_DISTANCE = 1.0
 
+        # --- Détection obstacle dans le cône avant ±90° ---
         ranges = np.array(self.ranges)
         angles = np.linspace(self.angle_min, self.angle_max, len(ranges), endpoint=False)
         ranges_clean = np.where(np.isinf(ranges), self.range_max, ranges)
+
         front_mask = (angles > -np.pi/2) & (angles < np.pi/2)
+        front_ranges = ranges_clean[front_mask]
 
         msg = Twist()
 
-        # Rotation en cours → continuer
-        if self.target_yaw is not None:
-            angle_diff = np.arctan2(np.sin(self.target_yaw - self.yaw), np.cos(self.target_yaw - self.yaw))
-            if abs(angle_diff) > 0.05:
-                msg.linear.x = 0.0
-                msg.angular.z = 0.5 * np.sign(angle_diff)
-                self.cmd_vel_pub.publish(msg)
-                return
-            else:
-                self.target_yaw = None
-
-        # Obstacle devant → tourner de 90°
-        if np.any(ranges_clean[front_mask] < 1.0):
-            self.rotation_count += 1
-            self.target_yaw = np.arctan2(
-                np.sin(self.yaw + np.pi/2),
-                np.cos(self.yaw + np.pi/2)
-            )
-            # Après 4 rotations (360°) sans avancer → changer de frontière
-            if self.rotation_count >= 4:
-                self.rotation_count = 0
-                self.last_target = self.last_target  # forcer un nouveau choix
-                self.excluded_target = self.last_target
+        if np.any(front_ranges < SAFETY_DISTANCE):
+            # Obstacle détecté → tourner vers le côté le plus dégagé
+            mean_left = np.mean(ranges_clean[angles > 0])
+            mean_right = np.mean(ranges_clean[angles < 0])
             msg.linear.x = 0.0
-            msg.angular.z = 0.0
+            msg.angular.z = 0.5 if mean_left > mean_right else -0.5
             self.cmd_vel_pub.publish(msg)
             return
 
-        # Pas d'obstacle → choisir frontière
-        self.rotation_count = 0
+        # --- Pas d'obstacle → aller vers la frontière la plus proche ---
         frontiers = self.get_frontiers()
 
         if len(frontiers) == 0:
@@ -303,23 +281,18 @@ class Agent(Node):
         resolution = self.map_msg.info.resolution
         origin_x = self.map_msg.info.origin.position.x
         origin_y = self.map_msg.info.origin.position.y
-        robot_i = int(np.floor((self.x - origin_x) / resolution))
-        robot_j = int(np.floor((-self.y - origin_y) / resolution))
 
-        # Exclure la frontière inaccessible si trop de rotations
-        excluded = getattr(self, 'excluded_target', None)
-        filtered = [f for f in frontiers if f != excluded] if excluded else frontiers
-        if len(filtered) == 0:
-            filtered = frontiers
-            self.excluded_target = None
+        robot_i = int(round((self.x - origin_x) / resolution))
+        robot_j = int(round((-self.y - origin_y) / resolution))
 
-        target = min(filtered, key=lambda f: (f[0]-robot_i)**2 + (f[1]-robot_j)**2)
-        self.last_target = target
+        target = min(frontiers, key=lambda f: (f[0] - robot_i)**2 + (f[1] - robot_j)**2)
 
         target_x = target[0] * resolution + origin_x
         target_y = -(target[1] * resolution + origin_y)
 
-        angle_to_target = np.arctan2(target_y - self.y, target_x - self.x)
+        dx = target_x - self.x
+        dy = target_y - self.y
+        angle_to_target = np.arctan2(dy, dx)
         angle_diff = np.arctan2(np.sin(angle_to_target - self.yaw), np.cos(angle_to_target - self.yaw))
 
         if abs(angle_diff) > 0.3:
@@ -330,7 +303,6 @@ class Agent(Node):
             msg.angular.z = 0.3 * angle_diff
 
         self.cmd_vel_pub.publish(msg)
-
 
 def main():
     rclpy.init()
