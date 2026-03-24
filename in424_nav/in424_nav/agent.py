@@ -29,7 +29,7 @@ class Agent(Node):
 
         
         #initialize attributes
-        self.agents_pose = [None]*self.nb_agents    #[(x_1, y_1), (x_2, y_2), (x_3, y_3)] if there are 3 agents
+        self.agents_pose = [None]*self.nb_agents  #[(x_1, y_1), (x_2, y_2), (x_3, y_3)] if there are 3 agents
         self.x = self.y = self.yaw = self.n = self.angle_increment = self.angle_max = self.angle_min = self.ranges = self.theta = self.range_max = None   #the pose of this specific agent running the node
         self.avoid_target_yaw = None  # target yaw for pi/2 avoidance rotation
         self.avoid_phase = 'none'  # 'none' | 'rotating' | 'moving_clear'
@@ -182,6 +182,9 @@ class Agent(Node):
         robot_i = int((self.x - origin_x) / resolution)
         robot_j = int((-self.y - origin_y) / resolution)
 
+        self.map[robot_j, robot_i] = FREE_SPACE_VALUE
+        self.obstacle_counts[robot_j, robot_i] = 0
+
         for r, x, y, detected in zip(self.ranges, xp_m, yp_m, detected_points):                
 
                 # conversion
@@ -242,148 +245,149 @@ class Agent(Node):
     def is_occupied_by_other_robot(self, i, j, res, ox, oy):
         for pose in self.agents_pose:
             if pose is None: continue
-            if abs(pose[0]-self.x) < 0.2 and abs(pose[1]-self.y) < 0.2: continue # ignore soi
+            if abs(pose[0]-self.x) < 0.2 and abs(pose[1]-self.y) < 0.2: continue 
             oi, oj = int((pose[0]-ox)/res), int((-pose[1]-oy)/res)
-            if abs(i - oi) <= 1 and abs(j - oj) <= 1:
-                return True
+            if abs(i - oi) <= 2 and abs(j - oj) <= 2: return True
         return False
-    
+
     def get_frontiers(self):
         frontiers = []
-        for j in range(1, self.h - 1):
-            for i in range(1, self.w - 1):
-                if self.map[j, i] == UNEXPLORED_SPACE_VALUE:
-                    # Une frontière est une zone inexplorée adjacente au vide
-                    for nj, ni in [(j-1,i),(j+1,i),(j,i-1),(j,i+1)]:
-                        if self.map[nj, ni] == FREE_SPACE_VALUE:
-                            frontiers.append((i, j))
-                            break
+        # Optimisation : balayage NumPy pour trouver les candidats inexplorés
+        y_indices, x_indices = np.where(self.map == UNEXPLORED_SPACE_VALUE)
+        for i, j in zip(x_indices, y_indices):
+            if 0 < i < self.w-1 and 0 < j < self.h-1:
+                # Voisins 4-connexes
+                if (self.map[j-1, i] == FREE_SPACE_VALUE or self.map[j+1, i] == FREE_SPACE_VALUE or 
+                    self.map[j, i-1] == FREE_SPACE_VALUE or self.map[j, i+1] == FREE_SPACE_VALUE):
+                    frontiers.append((i, j))
         return frontiers
 
-    # --- Pathfinding BFS ---
+    # =========================================================================
+    # PARTIE STRATÉGIE OPTIMISÉE
+    # =========================================================================
+
     def is_cell_safe(self, i, j):
-        """Vérifie si une case n'est pas un obstacle et n'est pas trop proche d'un mur (Inflation)"""
+        """ Logique d'inflation conservée """
         if not (0 <= i < self.w and 0 <= j < self.h): return False
         if self.map[j, i] == OBSTACLE_VALUE: return False
-        
-        # Inflation manuelle : on vérifie les 8 voisins. Si un mur est à 1 case, on évite.
         for ni, nj in [(i-1,j),(i+1,j),(i,j-1),(i,j+1), (i-1,j-1), (i+1,j+1), (i-1,j+1), (i+1,j-1)]:
             if 0 <= ni < self.w and 0 <= nj < self.h:
-                if self.map[nj, ni] == OBSTACLE_VALUE:
-                    return False
+                if self.map[nj, ni] == OBSTACLE_VALUE: return False
         return True
 
     def compute_path(self, start_i, start_j, target_i, target_j, res, ox, oy):
-        from collections import deque
+        """ BFS optimisé (reconstruction propre, Look-ahead réglable) """
         if (start_i, start_j) == (target_i, target_j): return 0, (target_i, target_j)
-            
         queue = deque([(start_i, start_j, 0)])
         parent = {(start_i, start_j): None}
-        directions = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+        dirs = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
         
+        target_found = None
         while queue:
             ci, cj, dist = queue.popleft()
             if (ci, cj) == (target_i, target_j):
-                path = []
-                curr = (ci, cj)
-                while curr is not None:
-                    path.append(curr); curr = parent[curr]
-                path.reverse()
-                # On vise à 2 cases devant pour ne pas raser les angles de trop près
-                idx = 2 if len(path) > 2 else (len(path)-1)
-                return dist, path[idx]
-
-            for di, dj in directions:
+                target_found = (ci, cj)
+                break
+            for di, dj in dirs:
                 ni, nj = ci + di, cj + dj
                 if 0 <= ni < self.w and 0 <= nj < self.h and (ni, nj) not in parent:
-                    # RÈGLE : Passer uniquement sur les cases SURES (pas de murs autour)
-                    # Sauf si on est au point de départ ou d'arrivée
-                    is_special = (ni, nj) == (target_i, target_j) or (ni, nj) == (start_i, start_j)
-                    if self.is_cell_safe(ni, nj) or is_special or self.is_occupied_by_other_robot(ni, nj, res, ox, oy):
+                    # Règle de passage conservée
+                    is_spec = (ni, nj) == (target_i, target_j) or (ni, nj) == (start_i, start_j)
+                    if self.is_cell_safe(ni, nj) or is_spec or self.is_occupied_by_other_robot(ni, nj, res, ox, oy):
                         parent[(ni, nj)] = (ci, cj)
                         queue.append((ni, nj, dist + 1))
+        
+        if target_found:
+            path = []
+            curr = target_found
+            while curr is not None:
+                path.append(curr); curr = parent[curr]
+            path.reverse()
+            # Index 2 pour stabilité virage
+            idx = 2 if len(path) > 2 else (len(path)-1)
+            return len(path), path[idx]
         return float('inf'), None
 
     def strategy(self):
+        """ Prise de décision tranchée avec calcul réduit """
         if self.x is None or self.ranges is None: return
         res = self.map_msg.info.resolution
         ox, oy = self.map_msg.info.origin.position.x, self.map_msg.info.origin.position.y
         ri, rj = int((self.x - ox) / res), int((-self.y - oy) / res)
         msg = Twist()
 
-        # 1. RÉFLEXE D'ÉVITEMENT AVEC ABANDON DE CIBLE
+        # 1. ÉVITEMENT RÉFLEXE (Contrainte Lidar)
         ranges_clean = np.where(np.isinf(self.ranges), self.range_max, self.ranges)
         mid = len(ranges_clean) // 2
-        # On regarde si quelque chose nous bloque vraiment à < 0.8m
-        if np.min(ranges_clean[mid-25:mid+25]) < 0.8:
-            self.current_target = None  # ABANDON de la cible car bloqué par mur physique
-            msg.linear.x = -0.2       # Petit recul pour sortir du piège
-            msg.angular.z = 0.8        # Rotation forte
+        if np.min(ranges_clean[mid-25 : mid+25]) < 0.8:
+            self.current_target = None 
+            msg.linear.x = -0.2 # Recul pour désengager
+            msg.angular.z = 0.8
             self.cmd_vel_pub.publish(msg)
             return
 
-        # 2. FRONTIÈRES
-        frontiers = self.get_frontiers()
-        if not frontiers:
-            msg.angular.z = 0.5; self.cmd_vel_pub.publish(msg)
-            return
+        # 2. VALIDATION CIBLE
+        if self.current_target:
+            # Si déjà exploré, on abandonne
+            if not (0 <= self.current_target[0] < self.w) or self.map[self.current_target[1], self.current_target[0]] != UNEXPLORED_SPACE_VALUE:
+                self.current_target = None
 
-        if self.current_target and self.map[self.current_target[1], self.current_target[0]] != UNEXPLORED_SPACE_VALUE:
-            self.current_target = None
-
-        # 3. PRISE DE DÉCISION (Nouveau calcul de Score avec pénalité angulaire)
+        # 3. SELECTION NOUVELLE CIBLE (Optimisée CPU)
         if self.current_target is None:
-            best_score = -float('inf')
-            # Trier par distance euclidienne avant de tester au BFS
+            frontiers = self.get_frontiers()
+            if not frontiers:
+                msg.angular.z = 0.5; self.cmd_vel_pub.publish(msg); return
+            
+            # Tri préalable par distance euclidienne (très rapide) pour limiter les BFS lourds
             frontiers.sort(key=lambda f: (f[0]-ri)**2 + (f[1]-rj)**2)
             
-            for f in frontiers[:40]:
+            best_score = -float('inf')
+            # On n'analyse que les 30 frontières les plus "proches" au vol d'oiseau
+            for f in frontiers[:30]:
                 d_me, _ = self.compute_path(ri, rj, f[0], f[1], res, ox, oy)
                 if d_me == float('inf'): continue
                 
-                # Calcul de l'angle pour atteindre cette frontière
+                # Pénalité d'angle (évite les demi-tours brusques)
                 fx, fy = f[0]*res + ox, -(f[1]*res + oy)
                 angle_to_f = np.arctan2(fy - self.y, fx - self.x)
                 angle_diff = abs(np.arctan2(np.sin(angle_to_f - self.yaw), np.cos(angle_to_f - self.yaw)))
-                
-                # Coopération (Distance des autres)
+
+                # Coopération (Distance aux autres)
                 min_d_others = 1000
                 for pose in self.agents_pose:
                     if pose is None or abs(pose[0]-self.x) < 0.2: continue
-                    oi, oj = int((pose[0]-ox)/res), int((-pose[1]-oy)/res)
-                    min_d_others = min(min_d_others, abs(f[0]-oi) + abs(f[1]-oj))
+                    d = abs(f[0]-int((pose[0]-ox)/res)) + abs(f[1]-int((-pose[1]-oy)/res))
+                    min_d_others = min(min_d_others, d)
                 
-                # --- SCORE RÉVISÉ ---
-                # dist_me pénalisé, dist_others récompensé
-                # GROSSE PÉNALITÉ si la cible est derrière nous (angle_diff grand)
+                # Logique de score conservée : plus proche moi, loin des autres, face au robot
                 score = (min_d_others * 2.0) - (d_me * 6.0) - (angle_diff * 15.0)
                 
                 if score > best_score:
                     best_score = score
                     self.current_target = f
 
-        # 4. NAVIGATION VERS LE WAYPOINT
+        # 4. NAVIGATION VERS WAYPOINT (Fluidité curviligne)
         if self.current_target:
-            _, wp = self.compute_path(ri, rj, self.current_target[0], self.current_target[1], res, ox, oy)
+            dist_path, wp = self.compute_path(ri, rj, self.current_target[0], self.current_target[1], res, ox, oy)
             if wp:
                 tx, ty = wp[0]*res + ox, -(wp[1]*res + oy)
                 diff = np.arctan2(ty - self.y, tx - self.x) - self.yaw
                 diff = np.arctan2(np.sin(diff), np.cos(diff))
                 
-                if abs(diff) > 0.6: # Virage important
-                    msg.linear.x = 0.2 # On rampe pour mieux pivoter
+                if abs(diff) > 0.6: # Besoin de pivoter d'abord
+                    msg.linear.x = 0.1 
                     msg.angular.z = 0.8 * np.sign(diff)
-                else: # Aligné
-                    msg.linear.x = 0.7 * (1.0 - abs(diff)) # Vitesse dégressive pour fluidité
+                else: # Marche en courbe (plus on est droit, plus on va vite)
+                    msg.linear.x = 0.5 * (1.0 - abs(diff)) 
                     msg.angular.z = 0.5 * diff
                 
                 self.cmd_vel_pub.publish(msg)
                 return
 
-        # Fallback
+        # Fallback rotation
         self.current_target = None
         msg.angular.z = 0.6; self.cmd_vel_pub.publish(msg)
-    
+
 def main():
     rclpy.init()
 
