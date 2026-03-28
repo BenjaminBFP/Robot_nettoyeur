@@ -4,8 +4,6 @@ __credits__ = ["Johvany Gustave", "Jonatan Alvarez"]
 __license__ = "Apache License 2.0"
 __version__ = "1.1.0"
 
-import queue
-
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry, OccupancyGrid
@@ -15,9 +13,9 @@ from rclpy.qos import qos_profile_sensor_data
 from tf_transformations import euler_from_quaternion
 from collections import deque
 import numpy as np
-
-from .my_common import *
 from time import time
+from .my_common import *
+import json
 class Agent(Node):
     def __init__(self):
         Node.__init__(self, "Agent")
@@ -28,10 +26,9 @@ class Agent(Node):
         self.x = self.y = self.yaw = 0.0
         self.ranges = None
         self.current_target = None 
-        
+        self.my_id = int(self.ns[-1]) - 1  # Mon index (0, 1 ou 2)
         self.map_agent_pub = self.create_publisher(OccupancyGrid, f"/{self.ns}/map", 1)
         self.init_map()
-        
         self.obstacle_counts = np.zeros(shape=(self.h, self.w), dtype=np.int16)
         
         # Abonnements odométrie optimisés
@@ -43,11 +40,11 @@ class Agent(Node):
         
         self.create_subscription(LaserScan, f"{self.ns}/laser/scan", self.lidar_cb, qos_profile=qos_profile_sensor_data)
         self.cmd_vel_pub = self.create_publisher(Twist, f"{self.ns}/cmd_vel", 1)
-        self.my_id = int(self.ns[-1]) - 1  # Mon index (0, 1 ou 2)
+
         # Timers : Fréquences ajustées pour fluidité/charge
-        self.create_timer(0.2, self.map_update) 
-        self.create_timer(0.3, self.strategy)   # 0.3 augmenter si bug pour plus de marge CPU
-        self.create_timer(1.0, self.publish_maps)
+        self.create_timer(0.25, self.map_update) 
+        self.create_timer(0.4, self.strategy)   # 3.3 Hz
+        self.create_timer(1.3, self.publish_maps)
 
     def _make_odom_cb(self, idx):
         def cb(msg):
@@ -114,8 +111,8 @@ class Agent(Node):
         self.map[robot_j, robot_i] = FREE_SPACE_VALUE
         self.obstacle_counts[robot_j, robot_i] = 0
 
-        for idx, (r, x, y, detected) in enumerate(zip(self.ranges, xp_m, yp_m, detected_points)):           
-                i, j = int(np.floor((x - origin_x) / resolution)), int(np.floor((y - origin_y) / resolution))
+        for r, x, y, detected in zip(self.ranges, xp_m, yp_m, detected_points):                
+                i, j = int((x - origin_x) / resolution), int((y - origin_y) / resolution)
                 if not (0 <= i < grid_size_x and 0 <= j < grid_size_y): continue
                 num = max(abs(i - robot_i), abs(j - robot_j))
                 if num == 0: continue
@@ -136,8 +133,6 @@ class Agent(Node):
                         if self.obstacle_counts[j, i] <= 4:
                             self.obstacle_counts[j, i] += 1
                             self.map[j, i] = OBSTACLE_VALUE
-        
-                
 
     def lidar_cb(self, msg):
         self.ranges = list(msg.ranges)
@@ -158,25 +153,44 @@ class Agent(Node):
         queue = deque([(start_i, start_j)])
         dist_grid[start_j, start_i] = 0
         
+        # Masque des zones interdites (murs + inflation 1 case)
+        # On utilise le fait que map == OBSTACLE_VALUE
+        is_obstacle = (self.map == OBSTACLE_VALUE)
+        
         while queue:
             ci, cj = queue.popleft()
             d = dist_grid[cj, ci]
+            if d > 40: break # Limite de recherche pour sauver du CPU
             
-            for di, dj in [(-1,0),(1,0),(0,-1),(0,1)]:
+            for di, dj in [(-1,0),(1,0),(0,-1),(0,1)]: # 4-voisinage pour rapidité
                 ni, nj = ci + di, cj + dj
                 if 0 <= ni < self.w and 0 <= nj < self.h:
                     if dist_grid[nj, ni] == 999 and self.map[nj, ni] != OBSTACLE_VALUE:
-                        new_d = d + 1
-                        if new_d > 40:
-                            continue
-                        else:
-                            dist_grid[nj, ni] = new_d
-                            parent_grid[(ni, nj)] = (ci, cj)
-                            queue.append((ni, nj))
+                        dist_grid[nj, ni] = d + 1
+                        parent_grid[(ni, nj)] = (ci, cj)
+                        queue.append((ni, nj))
         return dist_grid, parent_grid
 
+    def calcul_time(self,time_start):
+        time_end = time()
+        Dt = round(time_end - time_start,3)
+        log_time = "./ros2_ws/src/IN424/in424_nav/in424_nav/log_time.json"
+        try:
+            with open(log_time, "r") as f:
+                donnees = json.load(f)
+        except:
+            donnees = []
+
+            # Ajout
+        donnees.append(Dt)
+
+        # Écriture
+        with open(log_time, "w") as f:
+            json.dump(donnees, f)    
+    
     def strategy(self):
         time_start = time()
+    	
         if self.x is None or self.ranges is None: return
         res = self.map_msg.info.resolution
         ox, oy = self.map_msg.info.origin.position.x, self.map_msg.info.origin.position.y
@@ -192,6 +206,7 @@ class Agent(Node):
             msg.linear.x = -0.1 # Recul lent
             msg.angular.z = 0.8 # Rotation rapide pour changer d'angle
             self.cmd_vel_pub.publish(msg)
+            self.calcul_time(time_start)
             return
 
         # 2. CALCUL UNIQUE DES DISTANCES (L'optimisation majeure)
@@ -213,35 +228,36 @@ class Agent(Node):
 
         # 4. SCORING DES FRONTIÈRES
         if self.current_target is None or self.map[self.current_target[1], self.current_target[0]] != UNEXPLORED_SPACE_VALUE:
-    
-        # Positions des coéquipiers en grille
-            other_positions = [
-                (int((pose[0]-ox)/res), int((-pose[1]-oy)/res))
-                for r_idx, pose in enumerate(self.agents_pose)
-                if pose and r_idx != self.my_id
-            ]
+            best_score = -9999
+            my_id = int(self.ns[-1]) - 1 # Mon index (0, 1 ou 2)
 
-            # Filtrage vectorisé des frontières accessibles
-            mask = dist_map[yf, xf] < 999
-            yf_acc, xf_acc = yf[mask], xf[mask]
-            if len(xf_acc) == 0:
-                msg.angular.z = 0.5; self.cmd_vel_pub.publish(msg); return
-            
-            d_vals = dist_map[yf_acc, xf_acc].astype(float)
+            # On ne teste que les frontières accessibles (distance < 999)
+            for i in range(len(xf)):
+                fi, fj = xf[i], yf[i]
+                d = dist_map[fj, fi]
+                if d == 999: continue
+                
+                # NOUVEL AJOUT : Distance au robot coéquipier le plus proche
+                min_d_others = 1000
+                for r_idx, pose in enumerate(self.agents_pose):
+                    if pose and r_idx != my_id:
+                        oi, oj = int((pose[0]-ox)/res), int((-pose[1]-oy)/res)
+                        dist_other = abs(fi - oi) + abs(fj - oj)
+                        if dist_other < min_d_others: 
+                            min_d_others = dist_other
+                
+                # Calcul de l'angle diff vers la frontière
+                angle_to = np.arctan2(-(fj*res+oy) - self.y, fi*res+ox - self.x)
+                angle_diff = abs(np.arctan2(np.sin(angle_to-self.yaw), np.cos(angle_to-self.yaw)))
+                
+                # FORMULE AVEC COORDINATION : Moi (-) | Angle (-) | Autres (+)
+                score = - (d * 4.0) - (angle_diff * 5.0) + (min_d_others * 7.0)
 
-            angles_to = np.arctan2(-(yf_acc*res+oy) - self.y, xf_acc*res+ox - self.x)
-            angle_diffs = np.abs(np.arctan2(np.sin(angles_to - self.yaw), np.cos(angles_to - self.yaw)))
+                if score > best_score:
+                    best_score = score
+                    self.current_target = (fi, fj)
 
-            min_d_others = np.full(len(xf_acc), 1000.0)
-            for oi, oj in other_positions:
-                d_other = np.abs(xf_acc - oi) + np.abs(yf_acc - oj)
-                min_d_others = np.minimum(min_d_others, d_other)
-
-            scores = -(d_vals * 5.0) - (angle_diffs * 5.0) + (min_d_others * 10.0)
-            best_idx = np.argmax(scores)
-            self.current_target = (int(xf_acc[best_idx]), int(yf_acc[best_idx]))
-
-            # 5. NAVIGATION (Reconstruction du chemin via le dictionnaire parents)
+        # 5. NAVIGATION (Reconstruction du chemin via le dictionnaire parents)
         if self.current_target and self.current_target in parents:
             # On remonte le chemin pour trouver un waypoint à 3 cases devant
             path = []
@@ -266,10 +282,6 @@ class Agent(Node):
         # Fallback
         msg.angular.z = 0.5
         self.cmd_vel_pub.publish(msg)
-        time_end = time()
-        Dt = round(time_end - time_start,3 )
-        if Dt> 0.3-0.02: # Seuil de 300ms moins une marge pour éviter les faux positifs
-            self.get_logger().info(f"Strategy executed in {Dt} seconds")
 
 def main():
     rclpy.init()
