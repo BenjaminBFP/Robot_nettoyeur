@@ -23,9 +23,10 @@ class MapManager(Node):
 
         self.map_agents_pub = self.create_publisher(OccupancyGrid, "/merged_map", 1)
         self.map_rviz_pub = self.create_publisher(OccupancyGrid, "/map", 1)
-
+        self.obstacle_counts_pub = self.create_publisher(OccupancyGrid, "/merged_obstacle_counts", 1)
         for i in range(1, self.nb_agents+1):   #subscribe to agents' map topic
             self.create_subscription(OccupancyGrid, f"/bot_{i}/map", self.agent_map_cb, 1)
+            self.create_subscription(OccupancyGrid, f"/bot_{i}/obstacle_counts", self.agent_obstacle_counts_cb, 1)
         
         self.create_timer(1, self.publish_maps)
     
@@ -63,8 +64,8 @@ class MapManager(Node):
         self.map_rviz_msg = OccupancyGrid()
         self.map_rviz_msg.header = self.map_agents_msg.header
         self.map_rviz_msg.info = self.map_agents_msg.info
-
-    
+        self.map_poids = np.zeros(shape=(self.map_agents_msg.info.height, self.map_agents_msg.info.width), dtype=np.int8)   #to store the number of times a cell has been observed as an obstacle by the agents, to avoid false positives due to sensor noise
+        self.merged_obstacle_counts = np.zeros(shape=(self.h, self.w), dtype=np.int16)
     def agent_map_cb(self, msg):
         """ 
             @brief Get new maps from agent and merge them.
@@ -77,9 +78,14 @@ class MapManager(Node):
         received_map = np.flipud(np.array(msg.data).reshape(self.h, self.w))    #convert the received list into a 2D array and reverse rows
         for i in range(self.h):
             for j in range(self.w):
+                
                 if received_map[i, j] != UNEXPLORED_SPACE_VALUE:    #if the cell is not unexplored, update the merged map with the received value
                     self.merged_map[i, j] = received_map[i, j]
-    
+
+    def agent_obstacle_counts_cb(self, msg):
+        """Fusionne les obstacle_counts reçus en prenant le max cellule par cellule"""
+        received = np.flipud(np.array(msg.data).reshape(self.h, self.w)).astype(np.int16)
+        self.merged_obstacle_counts = np.maximum(self.merged_obstacle_counts, received)
 
     def publish_maps(self):
         """ Publish maps on corresponding topics """
@@ -91,6 +97,12 @@ class MapManager(Node):
 
         self.map_agents_pub.publish(self.map_agents_msg)    #publish the merged map to other agents on topic /merged_map
         self.map_rviz_pub.publish(self.map_rviz_msg)    #publish the merged map to RVIZ2 on topic /map
+       
+        counts_msg = OccupancyGrid()
+        counts_msg.header.frame_id = "map"
+        counts_msg.info = self.map_agents_msg.info
+        counts_msg.data = np.flipud(self.merged_obstacle_counts).flatten().tolist()
+        self.obstacle_counts_pub.publish(counts_msg)
 
 
 

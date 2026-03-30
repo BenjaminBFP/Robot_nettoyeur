@@ -31,6 +31,7 @@ class Agent(Node):
         self.current_target = None 
         self.my_id = int(self.ns[-1]) - 1  # Mon index (0, 1 ou 2)
         self.map_agent_pub = self.create_publisher(OccupancyGrid, f"/{self.ns}/map", 1)
+        self.obstacle_counts_pub = self.create_publisher(OccupancyGrid, f"/{self.ns}/obstacle_counts", 1)
         self.init_map()
         self.obstacle_counts = np.zeros(shape=(self.h, self.w), dtype=np.int16)
         
@@ -40,13 +41,14 @@ class Agent(Node):
         
         if self.nb_agents != 1:
             self.create_subscription(OccupancyGrid, "/merged_map", self.merged_map_cb, 1)
+            self.create_subscription(OccupancyGrid, "/merged_obstacle_counts", self.merged_obstacle_counts_cb, 1)
         
         self.create_subscription(LaserScan, f"{self.ns}/laser/scan", self.lidar_cb, qos_profile=qos_profile_sensor_data)
         self.cmd_vel_pub = self.create_publisher(Twist, f"{self.ns}/cmd_vel", 1)
 
         # Timers : Fréquences ajustées pour fluidité/charge
-        self.create_timer(0.2, self.map_update) 
-        self.create_timer(0.2, self.strategy)   # 3.3 Hz
+        self.create_timer(0.3, self.map_update) 
+        self.create_timer(0.22, self.strategy)   # 3.3 Hz
         self.create_timer(1.3, self.publish_maps)
 
     def _make_odom_cb(self, idx):
@@ -91,6 +93,7 @@ class Agent(Node):
     def map_update(self):
         """ FONCTION INCHANGÉE SELON CONSIGNE """
         if self.ranges is None or self.x is None: return
+        ranges = np.array(self.ranges)
         xp_m = []; yp_m = []
         angles = np.linspace(self.angle_min, self.angle_max, len(self.ranges), endpoint=False)
         yaw = self.yaw
@@ -98,67 +101,65 @@ class Agent(Node):
         y = self.y
         agents_pose = self.agents_pose
         detected_points = []    
-        for i, r in enumerate(self.ranges) :
+        for i, r in enumerate(ranges) :
             if np.isinf(r) :
                 detected_points.append(0)
-                self.ranges[i] = self.range_max
+                ranges[i] = self.range_max
                 r = self.range_max-1.5
             else :
                 detected_points.append(1)
-            xp_m.append(r * np.cos(angles[i])*np.cos(yaw) - r * np.sin(angles[i])*np.sin(yaw)+ x)
-            yp_m.append(-r * np.sin(angles[i])*np.cos(yaw) - r * np.cos(angles[i])*np.sin(yaw)- y)
+            xp_m.append(r * np.cos(angles[i]+yaw)+ x)
+            yp_m.append(-r * np.sin(angles[i]+yaw)- y)
        
         resolution = self.map_msg.info.resolution
         grid_size_x, grid_size_y = self.w, self.h
 
         origin_x, origin_y = self.map_msg.info.origin.position.x, self.map_msg.info.origin.position.y
-        robot_i, robot_j = int((x - origin_x) / resolution), int((-y - origin_y) / resolution)   
+        calcul_robot_i, calcul_robot_j = (x - origin_x) / resolution, (-y - origin_y) / resolution
         
+        robot_i, robot_j = int(calcul_robot_i), int(calcul_robot_j) 
         self.map[robot_j, robot_i] = FREE_SPACE_VALUE
         self.obstacle_counts[robot_j, robot_i] = 0
         
-        for r, x_, y_, detected in zip(self.ranges, xp_m, yp_m, detected_points):          
-                i, j = int((x_ - origin_x) / resolution), int((y_ - origin_y) / resolution)
-                if i<0 :
+        for r, x_, y_, detected in zip(ranges, xp_m, yp_m, detected_points):
+                calcul_i, calcul_j = (x_ - origin_x) / resolution, (y_ - origin_y) / resolution     
+                i, j = int(calcul_i), int(calcul_j)
+                if calcul_i<0 :
                     i=0
-                    # self.get_logger().info(f"i too low: {i}")
-                if i>=grid_size_x :
+                    # self.get_logger().info(f"i stoo low: {i}")
+                if calcul_i>=grid_size_x :
                     i=grid_size_x-1
                     # self.get_logger().info(f"i too high: {i}")
-                if j<0 :
+                if calcul_j<0 :
                     j=0
                     # self.get_logger().info(f"j too low: {j}")
-                if j>=grid_size_y :
+                if calcul_j>=grid_size_y :
                     j=grid_size_y-1        
                     # self.get_logger().info(f"j too high: {j}")
-                num = max(abs(i - robot_i), abs(j - robot_j))
+                num = int(max(abs(i - calcul_robot_i), abs(j - calcul_robot_j)))
                 if num == 0: continue
                 for k in range(num):
-                    xi, yj = int(round(robot_i + (i - robot_i) * k / num)), int(round(robot_j + (j - robot_j) * k / num))
-                    if 0 <= xi < grid_size_x and 0 <= yj < grid_size_y:
-                        if self.map[yj, xi] == OBSTACLE_VALUE:
-                            # On décrémente le compteur, on efface seulement si confirmé libre plusieurs fois
-                            self.obstacle_counts[yj, xi] -= 1
-                            if self.obstacle_counts[yj, xi] <= 0:
-                                self.obstacle_counts[yj, xi] = 0
-                                self.map[yj, xi] = FREE_SPACE_VALUE
-                        else:
-                            self.map[yj, xi] = FREE_SPACE_VALUE 
+                    xi, yj = int(np.round(calcul_robot_i + (calcul_i - calcul_robot_i) * k / num)), int(np.round(calcul_robot_j + (calcul_j - calcul_robot_j) * k / num))
+                    if 0 <= xi < grid_size_x and 0 <= yj < grid_size_y and self.obstacle_counts[yj, xi] <2:
+                        self.map[yj, xi] = FREE_SPACE_VALUE 
                 if detected == 1:
                     is_teammate = False      
                     for r_idx, pose in enumerate(agents_pose):
                         if pose and r_idx != self.my_id:
-                            pi = int(np.floor((pose[0] - origin_x) / resolution))
-                            pj = int(np.floor((pose[1] - origin_y) / resolution))
-                            if abs(i - pi) <= 2 and abs(j - pj) <= 2:  # tolérance 2 cases
+                            pi = int(np.round((pose[0] - origin_x) / resolution))
+                            pj = int(np.round((-pose[1] - origin_y) / resolution))
+                            if abs(i - pi) <= 2 and abs(j - pj) <= 2:  # tolérance 3 cases
                                 is_teammate = True
                                 break
                     if not is_teammate:
-                        if self.obstacle_counts[j, i] < 4:
+                        if self.obstacle_counts[j, i] <= 2:
                             self.obstacle_counts[j, i] += 1
                         self.map[j, i] = OBSTACLE_VALUE
                     else :
                         self.map[j, i] = FREE_SPACE_VALUE
+                else:
+                    self.obstacle_counts[j, i] -= 1
+                    self.map[j, i] = FREE_SPACE_VALUE
 
 
     def lidar_cb(self, msg):
@@ -169,7 +170,17 @@ class Agent(Node):
         self.map_msg.data = np.flipud(self.map).flatten().tolist()
         self.map_agent_pub.publish(self.map_msg)
 
-    # --- OPTIMISATION : GESTION DE TRAJECTOIRE ET COLLISIONS ---
+    def publish_obstacle_counts(self):
+        msg = OccupancyGrid()
+        msg.header.frame_id = "map"
+        msg.info = self.map_msg.info
+        msg.data = np.flipud(self.obstacle_counts).flatten().tolist()
+        self.obstacle_counts_pub.publish(msg)
+
+    def merged_obstacle_counts_cb(self, msg):
+        received = np.flipud(np.array(msg.data).reshape(self.h, self.w))
+        # Prendre le max entre compteur local et reçu
+        self.obstacle_counts = np.maximum(self.obstacle_counts, received).astype(np.int16)
 
     def calcul_time(self,time_start):
         time_end = time()
@@ -205,16 +216,17 @@ class Agent(Node):
                         return False
         return True
 
-    def find_path_dfs(self, start_i, start_j, goal_i, goal_j, max_depth=200, margin=None):
+    def find_path_dfs(self, start_i, start_j, goal_i, goal_j, max_depth=200, margin=None, shuffle_seed=None):
         if margin is None:
-            margin = 1  # 1 cellule = 0.5m
+            margin = 1
 
         stack = [(start_i, start_j, [(start_i, start_j)])]
         visited = set()
         visited.add((start_i, start_j))
 
-        # 4-voisinage uniquement : pas de diagonales pour éviter les coins
         directions = [(1,0), (-1,0), (0,1), (0,-1)]
+        
+        rng = np.random.RandomState(shuffle_seed)  # Graine contrôlée
 
         while stack:
             ci, cj, path = stack.pop()
@@ -238,7 +250,9 @@ class Agent(Node):
 
                 if cell == FREE_SPACE_VALUE and (margin == 0 or self.is_safe(ni, nj)):
                     dist = abs(ni - goal_i) + abs(nj - goal_j)
-                    neighbors.append((dist, ni, nj))
+                    # Ajout d'un bruit aléatoire pour varier les chemins
+                    noise = rng.uniform(0, 3)
+                    neighbors.append((dist + noise, ni, nj))
 
             neighbors.sort(reverse=True)
             for _, ni, nj in neighbors:
@@ -246,6 +260,21 @@ class Agent(Node):
                 stack.append((ni, nj, path + [(ni, nj)]))
 
         return None, False
+
+
+    def find_best_path(self, ri, rj, goal_i, goal_j, margin=None):
+        """Lance 5 DFS avec graines différentes, retourne le chemin le plus court"""
+        best_path = None
+        best_hit_unex = False
+
+        for seed in range(5):
+            path, hit_unex = self.find_path_dfs(ri, rj, goal_i, goal_j, margin=margin, shuffle_seed=seed)
+            if path is None: continue
+            if best_path is None or len(path) < len(best_path):
+                best_path = path
+                best_hit_unex = hit_unex
+
+        return best_path, best_hit_unex
 
     def strategy(self):
         time_start = time()
@@ -299,7 +328,7 @@ class Agent(Node):
                             min_d_others = dist_other
                 angle_to = np.arctan2(-(fj*res+oy) - self.y, fi*res+ox - self.x)
                 angle_diff = abs(np.arctan2(np.sin(angle_to-self.yaw), np.cos(angle_to-self.yaw)))
-                score = -(d * 5.0) - (angle_diff * 6.0) + (min_d_others * 7.0)
+                score = -(d * 5.0) - (angle_diff * 6.0) + (min_d_others * 8.0)
                 if score > best_score:
                     best_score = score
                     self.current_target = (fi, fj)
@@ -309,11 +338,11 @@ class Agent(Node):
             self.current_path = []
             self.path_idx = 0
         if not self.current_path:
-            path, _ = self.find_path_dfs(ri, rj, self.current_target[0], self.current_target[1])
+            path, hit_unex = self.find_best_path(ri, rj, self.current_target[0], self.current_target[1])
             
             if path is None or len(path) < 2:
                 # Fallback : recalcul sans marge de sécurité
-                path, _ = self.find_path_dfs(ri, rj, self.current_target[0], self.current_target[1], margin=0)
+                path, hit_unex = self.find_best_path(ri, rj, self.current_target[0], self.current_target[1])
             
             if path is None or len(path) < 2:
                 # Vraiment inaccessible → on tourne et on réessaie au prochain cycle
