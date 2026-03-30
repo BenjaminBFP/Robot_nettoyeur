@@ -22,6 +22,9 @@ class Agent(Node):
         self.load_params()
         
         # Attributs
+        self.current_path = []
+        self.path_idx = 0
+        self.last_map_hash = None
         self.agents_pose = [None] * self.nb_agents
         self.x = self.y = self.yaw = 0.0
         self.ranges = None
@@ -42,8 +45,8 @@ class Agent(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, f"{self.ns}/cmd_vel", 1)
 
         # Timers : Fréquences ajustées pour fluidité/charge
-        self.create_timer(0.25, self.map_update) 
-        self.create_timer(0.4, self.strategy)   # 3.3 Hz
+        self.create_timer(0.2, self.map_update) 
+        self.create_timer(0.2, self.strategy)   # 3.3 Hz
         self.create_timer(1.3, self.publish_maps)
 
     def _make_odom_cb(self, idx):
@@ -80,7 +83,6 @@ class Agent(Node):
         self.map = np.ones(shape=(self.h, self.w), dtype=np.int8) * UNEXPLORED_SPACE_VALUE
 
     def merged_map_cb(self, msg):
-        """ FONCTION INCHANGÉE SELON CONSIGNE """
         received_map = np.flipud(np.array(msg.data).reshape(self.h, self.w))
         for i in range(self.h):
             for j in range(self.w):
@@ -91,48 +93,73 @@ class Agent(Node):
         if self.ranges is None or self.x is None: return
         xp_m = []; yp_m = []
         angles = np.linspace(self.angle_min, self.angle_max, len(self.ranges), endpoint=False)
+        yaw = self.yaw
+        x = self.x
+        y = self.y
+        agents_pose = self.agents_pose
         detected_points = []    
         for i, r in enumerate(self.ranges) :
             if np.isinf(r) :
                 detected_points.append(0)
                 self.ranges[i] = self.range_max
-                r = self.range_max
+                r = self.range_max-1.5
             else :
                 detected_points.append(1)
-            xp_m.append(r * np.cos(angles[i])*np.cos(self.yaw) - r * np.sin(angles[i])*np.sin(self.yaw)+ self.x)
-            yp_m.append(-r * np.sin(angles[i])*np.cos(self.yaw) - r * np.cos(angles[i])*np.sin(self.yaw)- self.y)
+            xp_m.append(r * np.cos(angles[i])*np.cos(yaw) - r * np.sin(angles[i])*np.sin(yaw)+ x)
+            yp_m.append(-r * np.sin(angles[i])*np.cos(yaw) - r * np.cos(angles[i])*np.sin(yaw)- y)
        
         resolution = self.map_msg.info.resolution
         grid_size_x, grid_size_y = self.w, self.h
 
         origin_x, origin_y = self.map_msg.info.origin.position.x, self.map_msg.info.origin.position.y
-        robot_i, robot_j = int(np.floor((self.x - origin_x) / resolution)), int(np.floor((-self.y - origin_y) / resolution))
+        robot_i, robot_j = int((x - origin_x) / resolution), int((-y - origin_y) / resolution)   
         
         self.map[robot_j, robot_i] = FREE_SPACE_VALUE
         self.obstacle_counts[robot_j, robot_i] = 0
-
-        for r, x, y, detected in zip(self.ranges, xp_m, yp_m, detected_points):                
-                i, j = int((x - origin_x) / resolution), int((y - origin_y) / resolution)
-                if not (0 <= i < grid_size_x and 0 <= j < grid_size_y): continue
+        
+        for r, x_, y_, detected in zip(self.ranges, xp_m, yp_m, detected_points):          
+                i, j = int((x_ - origin_x) / resolution), int((y_ - origin_y) / resolution)
+                if i<0 :
+                    i=0
+                    # self.get_logger().info(f"i too low: {i}")
+                if i>=grid_size_x :
+                    i=grid_size_x-1
+                    # self.get_logger().info(f"i too high: {i}")
+                if j<0 :
+                    j=0
+                    # self.get_logger().info(f"j too low: {j}")
+                if j>=grid_size_y :
+                    j=grid_size_y-1        
+                    # self.get_logger().info(f"j too high: {j}")
                 num = max(abs(i - robot_i), abs(j - robot_j))
                 if num == 0: continue
                 for k in range(num):
-                    xi, yj = int(robot_i + (i - robot_i) * k / num), int(robot_j + (j - robot_j) * k / num)
+                    xi, yj = int(round(robot_i + (i - robot_i) * k / num)), int(round(robot_j + (j - robot_j) * k / num))
                     if 0 <= xi < grid_size_x and 0 <= yj < grid_size_y:
-                        if self.obstacle_counts[yj, xi] < 4: self.map[yj, xi] = FREE_SPACE_VALUE
+                        if self.map[yj, xi] == OBSTACLE_VALUE:
+                            # On décrémente le compteur, on efface seulement si confirmé libre plusieurs fois
+                            self.obstacle_counts[yj, xi] -= 1
+                            if self.obstacle_counts[yj, xi] <= 0:
+                                self.obstacle_counts[yj, xi] = 0
+                                self.map[yj, xi] = FREE_SPACE_VALUE
+                        else:
+                            self.map[yj, xi] = FREE_SPACE_VALUE 
                 if detected == 1:
-                    is_teammate = False
-                    for r_idx, pose in enumerate(self.agents_pose):
+                    is_teammate = False      
+                    for r_idx, pose in enumerate(agents_pose):
                         if pose and r_idx != self.my_id:
                             pi = int(np.floor((pose[0] - origin_x) / resolution))
-                            pj = int(np.floor((-pose[1] - origin_y) / resolution))
-                            if abs(i - pi) <= 2 and abs(j - pj) <= 2:  # tolérance 1 case
+                            pj = int(np.floor((pose[1] - origin_y) / resolution))
+                            if abs(i - pi) <= 2 and abs(j - pj) <= 2:  # tolérance 2 cases
                                 is_teammate = True
                                 break
                     if not is_teammate:
-                        if self.obstacle_counts[j, i] <= 4:
+                        if self.obstacle_counts[j, i] < 4:
                             self.obstacle_counts[j, i] += 1
-                            self.map[j, i] = OBSTACLE_VALUE
+                        self.map[j, i] = OBSTACLE_VALUE
+                    else :
+                        self.map[j, i] = FREE_SPACE_VALUE
+
 
     def lidar_cb(self, msg):
         self.ranges = list(msg.ranges)
@@ -143,33 +170,6 @@ class Agent(Node):
         self.map_agent_pub.publish(self.map_msg)
 
     # --- OPTIMISATION : GESTION DE TRAJECTOIRE ET COLLISIONS ---
-
-    def get_distance_map(self, start_i, start_j):
-        """ Calcule les distances de TOUTES les cellules au robot en 1 seul passage (BFS optimisé) """
-        dist_grid = np.full((self.h, self.w), 999, dtype=np.int16)
-        parent_grid = {} 
-        if not (0 <= start_i < self.w and 0 <= start_j < self.h): return dist_grid, parent_grid
-        
-        queue = deque([(start_i, start_j)])
-        dist_grid[start_j, start_i] = 0
-        
-        # Masque des zones interdites (murs + inflation 1 case)
-        # On utilise le fait que map == OBSTACLE_VALUE
-        is_obstacle = (self.map == OBSTACLE_VALUE)
-        
-        while queue:
-            ci, cj = queue.popleft()
-            d = dist_grid[cj, ci]
-            if d > 40: break # Limite de recherche pour sauver du CPU
-            
-            for di, dj in [(-1,0),(1,0),(0,-1),(0,1)]: # 4-voisinage pour rapidité
-                ni, nj = ci + di, cj + dj
-                if 0 <= ni < self.w and 0 <= nj < self.h:
-                    if dist_grid[nj, ni] == 999 and self.map[nj, ni] != OBSTACLE_VALUE:
-                        dist_grid[nj, ni] = d + 1
-                        parent_grid[(ni, nj)] = (ci, cj)
-                        queue.append((ni, nj))
-        return dist_grid, parent_grid
 
     def calcul_time(self,time_start):
         time_end = time()
@@ -187,101 +187,180 @@ class Agent(Node):
         # Écriture
         with open(log_time, "w") as f:
             json.dump(donnees, f)    
+    def path_still_valid(self):
+        """Vérifie que aucune cellule du chemin restant n'est devenue un obstacle"""
+        for wi, wj in self.current_path[self.path_idx:]:
+            if self.map[wj, wi] == OBSTACLE_VALUE:
+                return False
+        return True
     
+    def is_safe(self, i, j):
+        # 1 cellule de marge = 0.5m = 1 rayon robot
+        margin_cells = 1
+        for di in range(-margin_cells, margin_cells + 1):
+            for dj in range(-margin_cells, margin_cells + 1):
+                ni, nj = i + di, j + dj
+                if 0 <= ni < self.w and 0 <= nj < self.h:
+                    if self.map[nj, ni] == OBSTACLE_VALUE:
+                        return False
+        return True
+
+    def find_path_dfs(self, start_i, start_j, goal_i, goal_j, max_depth=200, margin=None):
+        if margin is None:
+            margin = 1  # 1 cellule = 0.5m
+
+        stack = [(start_i, start_j, [(start_i, start_j)])]
+        visited = set()
+        visited.add((start_i, start_j))
+
+        # 4-voisinage uniquement : pas de diagonales pour éviter les coins
+        directions = [(1,0), (-1,0), (0,1), (0,-1)]
+
+        while stack:
+            ci, cj, path = stack.pop()
+
+            if ci == goal_i and cj == goal_j:
+                return path, False
+
+            if len(path) > max_depth:
+                continue
+
+            neighbors = []
+            for di, dj in directions:
+                ni, nj = ci + di, cj + dj
+                if not (0 <= ni < self.w and 0 <= nj < self.h): continue
+                if (ni, nj) in visited: continue
+
+                cell = self.map[nj, ni]
+
+                if cell == UNEXPLORED_SPACE_VALUE:
+                    return path + [(ni, nj)], True
+
+                if cell == FREE_SPACE_VALUE and (margin == 0 or self.is_safe(ni, nj)):
+                    dist = abs(ni - goal_i) + abs(nj - goal_j)
+                    neighbors.append((dist, ni, nj))
+
+            neighbors.sort(reverse=True)
+            for _, ni, nj in neighbors:
+                visited.add((ni, nj))
+                stack.append((ni, nj, path + [(ni, nj)]))
+
+        return None, False
+
     def strategy(self):
         time_start = time()
-    	
         if self.x is None or self.ranges is None: return
+
         res = self.map_msg.info.resolution
         ox, oy = self.map_msg.info.origin.position.x, self.map_msg.info.origin.position.y
-        ri, rj = int((self.x - ox) / res), int((-self.y - oy) / res)
+        ri = int((self.x - ox) / res)
+        rj = int((-self.y - oy) / res)
         msg = Twist()
-
-        # 1. DÉTECTION COLLISION IMMINENTE (Ultra-réactif)
-        # On regarde uniquement si un mur est devant nous ET si on avance vers lui
-        mid = len(self.ranges) // 2
-        front_dist = np.min(np.array(self.ranges)[mid-20 : mid+20])
-        if front_dist < 1.5: # Trop proche d'un mur
-            self.current_target = None # Invalidation cible
-            msg.linear.x = -0.1 # Recul lent
-            msg.angular.z = 0.8 # Rotation rapide pour changer d'angle
-            self.cmd_vel_pub.publish(msg)
-            self.calcul_time(time_start)
-            return
-
-        # 2. CALCUL UNIQUE DES DISTANCES (L'optimisation majeure)
-        dist_map, parents = self.get_distance_map(ri, rj)
-
-        # 3. RECHERCHE DE FRONTIERES
-        # Vectorisé pour la vitesse
+        # self.get_logger().info(
+        #     f"pos=({self.x:.2f},{self.y:.2f}) "
+        #     f"grid=({ri},{rj}) "
+        #     f"cell={self.map[rj,ri] if 0<=ri<self.w and 0<=rj<self.h else 'OUT'} "
+        #     f"target={self.current_target} "
+        #     f"path_len={len(self.current_path)} "
+        #     f"path_idx={self.path_idx} "
+        #     f"next_wp={self.current_path[self.path_idx] if self.current_path else None}"
+        # )
+        # 1. RECHERCHE DE FRONTIÈRES
         is_unex = (self.map == UNEXPLORED_SPACE_VALUE)
         is_free = (self.map == FREE_SPACE_VALUE)
-        # Une cellule est frontière si Inconnue et touche une cellule Libre
         is_frontier = is_unex & (
-            (np.roll(is_free, 1, 0)) | (np.roll(is_free, -1, 0)) | 
+            (np.roll(is_free, 1, 0)) | (np.roll(is_free, -1, 0)) |
             (np.roll(is_free, 1, 1)) | (np.roll(is_free, -1, 1))
         )
         yf, xf = np.where(is_frontier)
-        
         if len(xf) == 0:
-            msg.angular.z = 0.5; self.cmd_vel_pub.publish(msg); return
+            msg.angular.z = 0.5
+            self.cmd_vel_pub.publish(msg)
+            return
 
-        # 4. SCORING DES FRONTIÈRES
-        if self.current_target is None or self.map[self.current_target[1], self.current_target[0]] != UNEXPLORED_SPACE_VALUE:
+        # 2. CHOIX DE CIBLE (seulement si on n'en a pas)
+        if (self.current_target is None or
+            self.map[self.current_target[1], self.current_target[0]] != UNEXPLORED_SPACE_VALUE):
+
+            self.current_path = []  # Invalider le chemin aussi
+            self.path_idx = 0
             best_score = -9999
-            my_id = int(self.ns[-1]) - 1 # Mon index (0, 1 ou 2)
-
-            # On ne teste que les frontières accessibles (distance < 999)
-            for i in range(len(xf)):
-                fi, fj = xf[i], yf[i]
-                d = dist_map[fj, fi]
-                if d == 999: continue
-                
-                # NOUVEL AJOUT : Distance au robot coéquipier le plus proche
+            my_id = int(self.ns[-1]) - 1
+            for idx in range(len(xf)):
+                fi, fj = xf[idx], yf[idx]
+                d = abs(fi - ri) + abs(fj - rj)
                 min_d_others = 1000
                 for r_idx, pose in enumerate(self.agents_pose):
                     if pose and r_idx != my_id:
-                        oi, oj = int((pose[0]-ox)/res), int((-pose[1]-oy)/res)
-                        dist_other = abs(fi - oi) + abs(fj - oj)
-                        if dist_other < min_d_others: 
+                        oi = int((pose[0]-ox)/res)
+                        oj = int((-pose[1]-oy)/res)
+                        dist_other = abs(fi-oi) + abs(fj-oj)
+                        if dist_other < min_d_others:
                             min_d_others = dist_other
-                
-                # Calcul de l'angle diff vers la frontière
                 angle_to = np.arctan2(-(fj*res+oy) - self.y, fi*res+ox - self.x)
                 angle_diff = abs(np.arctan2(np.sin(angle_to-self.yaw), np.cos(angle_to-self.yaw)))
-                
-                # FORMULE AVEC COORDINATION : Moi (-) | Angle (-) | Autres (+)
-                score = - (d * 4.0) - (angle_diff * 5.0) + (min_d_others * 7.0)
-
+                score = -(d * 5.0) - (angle_diff * 6.0) + (min_d_others * 7.0)
                 if score > best_score:
                     best_score = score
                     self.current_target = (fi, fj)
 
-        # 5. NAVIGATION (Reconstruction du chemin via le dictionnaire parents)
-        if self.current_target and self.current_target in parents:
-            # On remonte le chemin pour trouver un waypoint à 3 cases devant
-            path = []
-            curr = self.current_target
-            while curr in parents:
-                path.append(curr)
-                curr = parents[curr]
+        # 3. CALCUL DU CHEMIN (seulement si pas de chemin en cours)
+        if not self.current_path or not self.path_still_valid():
+            self.current_path = []
+            self.path_idx = 0
+        if not self.current_path:
+            path, _ = self.find_path_dfs(ri, rj, self.current_target[0], self.current_target[1])
             
-            if path:
-                target_wp = path[-min(len(path), 3)] # Waypoint local
-                tx, ty = target_wp[0]*res+ox, -(target_wp[1]*res+oy)
-                
-                diff = np.arctan2(ty - self.y, tx - self.x) - self.yaw
-                diff = np.arctan2(np.sin(diff), np.cos(diff))
-                
-                # Commande de vitesse fluide
-                msg.linear.x = 0.4 * (1.0 - abs(diff/1.5))
-                msg.angular.z = 0.7 * diff
+            if path is None or len(path) < 2:
+                # Fallback : recalcul sans marge de sécurité
+                path, _ = self.find_path_dfs(ri, rj, self.current_target[0], self.current_target[1], margin=0)
+            
+            if path is None or len(path) < 2:
+                # Vraiment inaccessible → on tourne et on réessaie au prochain cycle
+                msg.angular.z = 0.5
                 self.cmd_vel_pub.publish(msg)
+                self.calcul_time(time_start)
                 return
+            
+            self.current_path = path
+            self.path_idx = 0
+        # 4. AVANCER DANS LE CHEMIN : passer au waypoint suivant si assez proche
+        while self.path_idx < len(self.current_path) - 1:
+            wi, wj = self.current_path[self.path_idx]
+            tx = wi * res + ox
+            ty = -(wj * res + oy)
+            dist_to_wp = np.sqrt((self.x - tx)**2 + (self.y - ty)**2)
+            if dist_to_wp < res * 1.5:
+                self.path_idx += 1
+            else:
+                break
 
-        # Fallback
-        msg.angular.z = 0.5
+        # Détection fin de chemin : dernier waypoint atteint OU assez proche
+        if self.path_idx >= len(self.current_path) - 1:
+            wi, wj = self.current_path[-1]
+            tx = wi * res + ox
+            ty = -(wj * res + oy)
+            dist_final = np.sqrt((self.x - tx)**2 + (self.y - ty)**2)
+            if dist_final < res * 3.0:  # Tolérance plus large pour la fin
+                self.current_path = []
+                self.path_idx = 0
+                self.current_target = None  # Recalcul cible + chemin
+                msg.angular.z = 0.5
+                self.cmd_vel_pub.publish(msg)
+                self.calcul_time(time_start)
+                return
+        # 5. NAVIGATION vers waypoint courant
+        wi, wj = self.current_path[self.path_idx]
+        tx = wi * res + ox
+        ty = -(wj * res + oy)
+
+        diff = np.arctan2(ty - self.y, tx - self.x) - self.yaw
+        diff = np.arctan2(np.sin(diff), np.cos(diff))
+
+        msg.linear.x = 0.4 * (1.0 - abs(diff / 1.5))
+        msg.angular.z = 0.7 * diff
         self.cmd_vel_pub.publish(msg)
+        self.calcul_time(time_start)
 
 def main():
     rclpy.init()
