@@ -33,8 +33,8 @@ class Agent(Node):
         self.map_agent_pub = self.create_publisher(OccupancyGrid, f"/{self.ns}/map", 1)
         self.obstacle_counts_pub = self.create_publisher(OccupancyGrid, f"/{self.ns}/obstacle_counts", 1)
         self.init_map()
-        self.obstacle_counts = np.zeros(shape=(self.h, self.w), dtype=np.int16)
-        
+        self.obstacle_counts = np.zeros(shape=(self.h, self.w), dtype=np.int16)  # temporaire, locale
+        self.merged_obstacle_counts = np.zeros(shape=(self.h, self.w), dtype=np.int16)  # reçue du manager
         # Abonnements odométrie optimisés
         for i in range(1, self.nb_agents + 1):  
             self.create_subscription(Odometry, f"/bot_{i}/odom", self._make_odom_cb(i-1), 1)
@@ -50,6 +50,7 @@ class Agent(Node):
         self.create_timer(0.3, self.map_update) 
         self.create_timer(0.22, self.strategy)   # 3.3 Hz
         self.create_timer(1.3, self.publish_maps)
+        self.create_timer(1.3, self.publish_obstacle_counts)
 
     def _make_odom_cb(self, idx):
         def cb(msg):
@@ -93,8 +94,10 @@ class Agent(Node):
     def map_update(self):
         """ FONCTION INCHANGÉE SELON CONSIGNE """
         if self.ranges is None or self.x is None: return
+        self.obstacle_counts = np.zeros(shape=(self.h, self.w), dtype=np.int16)
         ranges = np.array(self.ranges)
         xp_m = []; yp_m = []
+        resolution = self.map_msg.info.resolution
         angles = np.linspace(self.angle_min, self.angle_max, len(self.ranges), endpoint=False)
         yaw = self.yaw
         x = self.x
@@ -102,16 +105,16 @@ class Agent(Node):
         agents_pose = self.agents_pose
         detected_points = []    
         for i, r in enumerate(ranges) :
-            if np.isinf(r) :
+            if np.isinf(r) or r >= self.scan.range_max:
                 detected_points.append(0)
                 ranges[i] = self.range_max
-                r = self.range_max-1.5
+                r = self.range_max-resolution
             else :
                 detected_points.append(1)
-            xp_m.append(r * np.cos(angles[i]+yaw)+ x)
-            yp_m.append(-r * np.sin(angles[i]+yaw)- y)
+            xp_m.append((r-resolution) * np.cos(angles[i]+yaw)+ x)
+            yp_m.append(-(r-resolution) * np.sin(angles[i]+yaw)- y)
        
-        resolution = self.map_msg.info.resolution
+
         grid_size_x, grid_size_y = self.w, self.h
 
         origin_x, origin_y = self.map_msg.info.origin.position.x, self.map_msg.info.origin.position.y
@@ -124,25 +127,18 @@ class Agent(Node):
         for r, x_, y_, detected in zip(ranges, xp_m, yp_m, detected_points):
                 calcul_i, calcul_j = (x_ - origin_x) / resolution, (y_ - origin_y) / resolution     
                 i, j = int(calcul_i), int(calcul_j)
-                if calcul_i<0 :
-                    i=0
-                    # self.get_logger().info(f"i stoo low: {i}")
-                if calcul_i>=grid_size_x :
-                    i=grid_size_x-1
-                    # self.get_logger().info(f"i too high: {i}")
-                if calcul_j<0 :
-                    j=0
-                    # self.get_logger().info(f"j too low: {j}")
-                if calcul_j>=grid_size_y :
-                    j=grid_size_y-1        
-                    # self.get_logger().info(f"j too high: {j}")
+                if calcul_i<0 :i=0
+
+                if calcul_i>=grid_size_x :i=grid_size_x-1
+                if calcul_j<0 :j=0 
+                if calcul_j>=grid_size_y :j=grid_size_y-1
                 num = int(max(abs(i - calcul_robot_i), abs(j - calcul_robot_j)))
                 if num == 0: continue
                 for k in range(num):
-                    xi, yj = int(np.round(calcul_robot_i + (calcul_i - calcul_robot_i) * k / num)), int(np.round(calcul_robot_j + (calcul_j - calcul_robot_j) * k / num))
-                    if 0 <= xi < grid_size_x and 0 <= yj < grid_size_y and self.obstacle_counts[yj, xi] <2:
+                    xi, yj = int(calcul_robot_i + (i - calcul_robot_i) * k / num), int(calcul_robot_j + (j - calcul_robot_j) * k / num)
+                    if 0 <= xi < grid_size_x and 0 <= yj < grid_size_y and self.map[yj, xi] != OBSTACLE_VALUE:
                         self.map[yj, xi] = FREE_SPACE_VALUE 
-                if detected == 1:
+                if detected == 1 :
                     is_teammate = False      
                     for r_idx, pose in enumerate(agents_pose):
                         if pose and r_idx != self.my_id:
@@ -152,14 +148,12 @@ class Agent(Node):
                                 is_teammate = True
                                 break
                     if not is_teammate:
-                        if self.obstacle_counts[j, i] <= 2:
+                        if self.merged_obstacle_counts[j, i] <= 2:
                             self.obstacle_counts[j, i] += 1
                         self.map[j, i] = OBSTACLE_VALUE
                     else :
-                        self.map[j, i] = FREE_SPACE_VALUE
-                else:
-                    self.obstacle_counts[j, i] -= 1
-                    self.map[j, i] = FREE_SPACE_VALUE
+                       continue
+         
 
 
     def lidar_cb(self, msg):
@@ -178,10 +172,8 @@ class Agent(Node):
         self.obstacle_counts_pub.publish(msg)
 
     def merged_obstacle_counts_cb(self, msg):
-        received = np.flipud(np.array(msg.data).reshape(self.h, self.w))
-        # Prendre le max entre compteur local et reçu
-        self.obstacle_counts = np.maximum(self.obstacle_counts, received).astype(np.int16)
-
+        received = np.flipud(np.array(msg.data).reshape(self.h, self.w)).astype(np.int16)
+        self.merged_obstacle_counts = received
     def calcul_time(self,time_start):
         time_end = time()
         Dt = round(time_end - time_start,3)
@@ -216,9 +208,9 @@ class Agent(Node):
                         return False
         return True
 
-    def find_path_dfs(self, start_i, start_j, goal_i, goal_j, max_depth=200, margin=None, shuffle_seed=None):
-        if margin is None:
-            margin = 1
+    def find_path_dfs(self, start_i, start_j, goal_i, goal_j, max_depth=65, shuffle_seed=None):
+
+        margin = 1
 
         stack = [(start_i, start_j, [(start_i, start_j)])]
         visited = set()
@@ -262,13 +254,13 @@ class Agent(Node):
         return None, False
 
 
-    def find_best_path(self, ri, rj, goal_i, goal_j, margin=None):
+    def find_best_path(self, ri, rj, goal_i, goal_j):
         """Lance 5 DFS avec graines différentes, retourne le chemin le plus court"""
         best_path = None
         best_hit_unex = False
 
         for seed in range(5):
-            path, hit_unex = self.find_path_dfs(ri, rj, goal_i, goal_j, margin=margin, shuffle_seed=seed)
+            path, hit_unex = self.find_path_dfs(ri, rj, goal_i, goal_j, shuffle_seed=seed)
             if path is None: continue
             if best_path is None or len(path) < len(best_path):
                 best_path = path
@@ -285,15 +277,6 @@ class Agent(Node):
         ri = int((self.x - ox) / res)
         rj = int((-self.y - oy) / res)
         msg = Twist()
-        # self.get_logger().info(
-        #     f"pos=({self.x:.2f},{self.y:.2f}) "
-        #     f"grid=({ri},{rj}) "
-        #     f"cell={self.map[rj,ri] if 0<=ri<self.w and 0<=rj<self.h else 'OUT'} "
-        #     f"target={self.current_target} "
-        #     f"path_len={len(self.current_path)} "
-        #     f"path_idx={self.path_idx} "
-        #     f"next_wp={self.current_path[self.path_idx] if self.current_path else None}"
-        # )
         # 1. RECHERCHE DE FRONTIÈRES
         is_unex = (self.map == UNEXPLORED_SPACE_VALUE)
         is_free = (self.map == FREE_SPACE_VALUE)
@@ -303,7 +286,8 @@ class Agent(Node):
         )
         yf, xf = np.where(is_frontier)
         if len(xf) == 0:
-            msg.angular.z = 0.5
+            msg.linear.x = 0.0
+            msg.angular.z = 0.0
             self.cmd_vel_pub.publish(msg)
             return
 
@@ -332,8 +316,6 @@ class Agent(Node):
                 if score > best_score:
                     best_score = score
                     self.current_target = (fi, fj)
-
-        # 3. CALCUL DU CHEMIN (seulement si pas de chemin en cours)
         if not self.current_path or not self.path_still_valid():
             self.current_path = []
             self.path_idx = 0
@@ -345,7 +327,6 @@ class Agent(Node):
                 path, hit_unex = self.find_best_path(ri, rj, self.current_target[0], self.current_target[1])
             
             if path is None or len(path) < 2:
-                # Vraiment inaccessible → on tourne et on réessaie au prochain cycle
                 msg.angular.z = 0.5
                 self.cmd_vel_pub.publish(msg)
                 self.calcul_time(time_start)
@@ -353,17 +334,12 @@ class Agent(Node):
             
             self.current_path = path
             self.path_idx = 0
-        # 4. AVANCER DANS LE CHEMIN : passer au waypoint suivant si assez proche
-        while self.path_idx < len(self.current_path) - 1:
             wi, wj = self.current_path[self.path_idx]
             tx = wi * res + ox
             ty = -(wj * res + oy)
             dist_to_wp = np.sqrt((self.x - tx)**2 + (self.y - ty)**2)
             if dist_to_wp < res * 1.5:
                 self.path_idx += 1
-            else:
-                break
-
         # Détection fin de chemin : dernier waypoint atteint OU assez proche
         if self.path_idx >= len(self.current_path) - 1:
             wi, wj = self.current_path[-1]

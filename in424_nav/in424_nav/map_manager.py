@@ -85,7 +85,7 @@ class MapManager(Node):
     def agent_obstacle_counts_cb(self, msg):
         """Fusionne les obstacle_counts reçus en prenant le max cellule par cellule"""
         received = np.flipud(np.array(msg.data).reshape(self.h, self.w)).astype(np.int16)
-        self.merged_obstacle_counts = np.maximum(self.merged_obstacle_counts, received)
+        self.merged_obstacle_counts += received
 
     def publish_maps(self):
         """ Publish maps on corresponding topics """
